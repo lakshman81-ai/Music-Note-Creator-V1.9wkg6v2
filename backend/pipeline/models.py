@@ -15,6 +15,7 @@ class MetaData:
 class AlternativePitch:
     midi: int
     confidence: float
+    source: str = "unknown"
 
 @dataclass
 class NoteEvent:

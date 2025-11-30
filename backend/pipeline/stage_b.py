@@ -1,17 +1,13 @@
 import numpy as np
 import librosa
-from backend.pipeline.models import NoteEvent, ChordEvent, MetaData
+from backend.pipeline.models import NoteEvent, ChordEvent, MetaData, AlternativePitch
 from typing import List, Tuple
 import os
 import scipy.signal
 
 # Try imports for heavy ML models
-try:
-    from basic_pitch.inference import predict
-    BASIC_PITCH_AVAILABLE = True
-except ImportError:
-    BASIC_PITCH_AVAILABLE = False
-    print("Basic Pitch not available.")
+# Basic Pitch removed as per request (Deep Analysis Default)
+BASIC_PITCH_AVAILABLE = False
 
 try:
     import crepe
@@ -49,48 +45,13 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
     n_fft = meta.window_size
     hop_length = n_fft // 4
 
-    # B1. Fallback Chain
-    # Priority: Basic-Pitch (Polyphonic)
+    # B1. Pitch Detection
+    # Primary: CREPE
+    # Secondary: HPSS/Librosa (for alternatives)
 
-    has_polyphonic_result = False
-
-    if BASIC_PITCH_AVAILABLE:
-        import tempfile
-        import soundfile as sf
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, y, sr)
-            tmp_path = tmp.name
-
-        try:
-            _, midi_data, _ = predict(tmp_path)
-
-            for instrument in midi_data.instruments:
-                for note in instrument.notes:
-                    events.append(NoteEvent(
-                        id=f"bp_{len(events)}",
-                        midi_note=note.pitch,
-                        start_sec=note.start,
-                        end_sec=note.end,
-                        start_beat=0.0,
-                        duration_beat=0.0,
-                        confidence=0.9,
-                        type="normal",
-                        voice=1
-                    ))
-
-            has_polyphonic_result = len(events) > 0
-            meta.processing_mode = "basic_pitch"
-
-        except Exception as e:
-            print(f"Basic Pitch failed: {e}")
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    # Fallback: CREPE (Monophonic)
-    if not has_polyphonic_result and CREPE_AVAILABLE:
-        print("Falling back to CREPE...")
+    # 1. Run CREPE (Primary)
+    if CREPE_AVAILABLE:
+        print("Running CREPE (Primary)...")
         try:
             # B4. Vibrato & Modulation Handling (Pre-processing for Crepe?)
             # Actually Crepe handles vibrato well, but we need to smooth the output pitch curve.
@@ -159,15 +120,16 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
                             ))
                         current_event = None
 
-            meta.processing_mode = "crepe"
-            has_polyphonic_result = True
+            meta.processing_mode = "crepe_deep"
 
         except Exception as e:
             print(f"CREPE failed: {e}")
 
-    # Fallback: HPSS + Librosa
-    if not has_polyphonic_result:
-        print("Falling back to Librosa (HPSS)...")
+    # 2. Run HPSS + Librosa (Secondary - for Alternatives)
+    # Always run this for "Deep Analysis" to provide alternatives
+    print("Running Librosa (HPSS) for alternatives...")
+    hpss_events = []
+    try:
         y_harmonic, _ = librosa.effects.hpss(y)
         f0, voiced_flag, voiced_probs = librosa.pyin(y_harmonic, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr, frame_length=n_fft)
         times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
@@ -187,28 +149,55 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
                     else:
                         duration = t - current_event["start"]
                         if duration > 0.05:
-                            events.append(NoteEvent(
-                                id=f"pyin_{len(events)}",
-                                midi_note=current_event["midi"],
-                                start_sec=current_event["start"],
-                                end_sec=t,
-                                start_beat=0, duration_beat=0,
-                                confidence=0.7, type="normal", voice=1
-                            ))
+                            hpss_events.append({
+                                "midi": current_event["midi"],
+                                "start": current_event["start"],
+                                "end": t,
+                                "conf": 0.7 # Librosa doesn't give direct confidence like Crepe per se, use prob if available or constant
+                            })
                         current_event = {"start": t, "midi": midi_round, "count": 1}
             else:
                  if current_event:
                         duration = t - current_event["start"]
                         if duration > 0.05:
-                            events.append(NoteEvent(
-                                id=f"pyin_{len(events)}",
-                                midi_note=current_event["midi"],
-                                start_sec=current_event["start"],
-                                end_sec=t,
-                                start_beat=0, duration_beat=0,
-                                confidence=0.7, type="normal", voice=1
-                            ))
+                             hpss_events.append({
+                                "midi": current_event["midi"],
+                                "start": current_event["start"],
+                                "end": t,
+                                "conf": 0.7
+                            })
                         current_event = None
+    except Exception as e:
+        print(f"HPSS failed: {e}")
+
+    # 3. Match HPSS events to CREPE events (Alternatives)
+    if events and hpss_events:
+        for m_event in events:
+            # Find overlapping HPSS events
+            for h_event in hpss_events:
+                # Check overlap
+                start = max(m_event.start_sec, h_event["start"])
+                end = min(m_event.end_sec, h_event["end"])
+                overlap = end - start
+
+                if overlap > 0.05: # Minimal overlap to consider
+                     # Add as alternative if pitch is different
+                     if h_event["midi"] != m_event.midi_note:
+                         # Check if already added
+                         already_exists = any(a.midi == h_event["midi"] and a.source == "hpss" for a in m_event.alternatives)
+                         if not already_exists:
+                             m_event.alternatives.append(AlternativePitch(
+                                 midi=h_event["midi"],
+                                 confidence=h_event["conf"],
+                                 source="hpss"
+                             ))
+
+    # If CREPE failed completely (no events), maybe use HPSS as fallback?
+    # User said "Option B. Ignore it" regarding missing notes.
+    # But if events list is empty, we have no result.
+    # Assuming "Ignore it" means "don't add HPSS notes that don't overlap with CREPE notes".
+    # So if CREPE finds nothing, we return nothing.
+    # This aligns with "eliminate basic pitch" and "CREPE primary".
 
 
     # B2. Attack / Transient Modeling
@@ -241,7 +230,10 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
         # Get frame index
         t_center = (e.start_sec + e.end_sec) / 2
         frame_idx = int(t_center * sr / hop_length)
-        if frame_idx >= S.shape[1]: continue
+        if frame_idx >= S.shape[1]:
+            # Try to clamp or just skip if out of bounds (end of file)
+            frame_idx = S.shape[1] - 1
+            if frame_idx < 0: continue
 
         f0 = librosa.midi_to_hz(e.midi_note)
 
