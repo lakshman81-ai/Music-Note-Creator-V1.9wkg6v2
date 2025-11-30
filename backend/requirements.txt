@@ -1,0 +1,9 @@
+fastapi==0.109.2
+uvicorn==0.27.1
+python-multipart==0.0.9
+basic-pitch==0.3.0
+librosa==0.10.1
+music21==9.1.0
+numpy==1.26.4
+scipy==1.12.0
+tensorflow-cpu; sys_platform == 'linux'
