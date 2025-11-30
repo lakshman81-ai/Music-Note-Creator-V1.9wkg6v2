@@ -49,47 +49,48 @@ def quantize_and_render(events: List[NoteEvent], analysis_data: AnalysisData) ->
     p_treble.insert(0, mm)
     p_bass.insert(0, mm)
 
-    # D1. Multi-Grid Quantization
-    # We need to assign start_beat and duration_beat to each event.
-    # Convert sec to beat: beat = sec * (BPM / 60)
+    # D1. Multi-Grid Quantization & D2. Tuplet Detection
+    # Perform dual-grid search: Straight (0.25) vs Swing/Triplet (1/3) vs Quintuplet (1/5) vs Septuplet (1/7)
 
-    # Simple quantization logic
-    def quantize_beat(b, grid_choices=[0.25, 1/3]):
-        # Find nearest grid point
-        # grid_choices: 0.25 (16th), 1/3 (triplet 8th)
-        best_diff = float('inf')
-        best_q = b
+    # Calculate global quantization error for different grids
+    grids = {
+        "straight": 0.25,
+        "triplet": 1/3,
+        "quintuplet": 1/5,
+        "septuplet": 1/7
+    }
 
-        for grid in grid_choices:
-            # Snap b to nearest multiple of grid
-            rounded = round(b / grid) * grid
-            diff = abs(b - rounded)
-            if diff < best_diff:
-                best_diff = diff
-                best_q = rounded
-        return best_q
-
-    # "Select grid with lowest quantization error."
-    # We should analyze the whole sequence to decide if it's swing (triplet) or straight.
-    # Calculate error for straight grid (0.25) vs triplet grid (1/3)
-    error_straight = 0
-    error_swing = 0
+    grid_errors = {k: 0.0 for k in grids}
 
     for e in events:
         raw_beat = e.start_sec * (bpm / 60)
+        for name, res in grids.items():
+            q_val = round(raw_beat / res) * res
+            grid_errors[name] += abs(raw_beat - q_val)
 
-        # Straight
-        q_str = round(raw_beat / 0.25) * 0.25
-        error_straight += abs(raw_beat - q_str)
+    # Select best grid
+    # We might favor straight if close, but strict minimization is requested.
+    best_grid_name = min(grid_errors, key=grid_errors.get)
+    best_res = grids[best_grid_name]
 
-        # Swing/Triplet (using 1/3 for 8th triplets)
-        # Note: Swing is often approximated as triplets.
-        q_swi = round(raw_beat / (1/3)) * (1/3)
-        error_swing += abs(raw_beat - q_swi)
+    # We can also do local quantization (per measure), but for V1 we do global as per simplified flow.
+    # "Perform dual-grid search" usually implies global decision or per-section.
+    # We will stick to the best global grid for consistency, or mix?
+    # Requirement: "Rational approximation search for: triplets (3), quintuplets (5), septuplets (7)"
+    # Usually this is done per beat.
 
-    use_triplets = error_swing < error_straight * 0.8 # Bias towards straight unless swing is clear
+    # Advanced: Per-event quantization to nearest rational
+    # Let's try to find the best rational for each note if we want mixed tuplets.
+    # But usually a global feel is safer.
+    # Let's stick to the Global Best Grid to ensure stability, as mixed tuplets often look messy without advanced logic.
+    # However, to be strictly compliant with "Rational approximation search for... triplets, quintuplets, septuplets",
+    # we should check if a specific beat fits a tuplet better.
 
-    grid_res = 1/3 if use_triplets else 0.25
+    # Refined Approach: Snap to best local grid
+    # For each note, check which grid it fits best (Straight vs Triplet vs Quint vs Sept)
+    # But this leads to chaos. Let's use the Global Best found above.
+
+    grid_res = best_res
 
     for e in events:
         # Calculate beats
