@@ -1,29 +1,36 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import shutil
 import os
 import tempfile
-from backend.transcription import transcribe_audio
+import json
+from backend.transcription import transcribe_audio, transcribe_audio_pipeline
 
 app = FastAPI()
 
 # Allow CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify the frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mock flag - can be set via env var or assumed True for this sandbox
+# Mock flag
 USE_MOCK = os.getenv("USE_MOCK_TRANSCRIPTION", "True").lower() == "true"
 
 @app.post("/api/transcribe")
-async def transcribe(file: UploadFile = File(...)):
+async def transcribe(
+    file: UploadFile = File(...),
+    stereo_mode: bool = Form(False),
+    start_offset: float = Form(0.0), # Added based on requirements
+    max_duration: float = Form(None)
+):
     """
     Endpoint to handle audio file upload and return MusicXML.
+    Supports stereo_mode form field.
     """
     try:
         # Save uploaded file temporarily
@@ -33,11 +40,22 @@ async def transcribe(file: UploadFile = File(...)):
             tmp_path = tmp.name
 
         try:
-            # Process the file
-            musicxml_content = transcribe_audio(tmp_path, use_mock=USE_MOCK)
+            # Run pipeline
+            # We use the new pipeline logic
+            # Note: valid API response format is XML ("retain present format")
 
-            # Return XML with correct MIME type
-            return Response(content=musicxml_content, media_type="application/xml")
+            result = transcribe_audio_pipeline(tmp_path, stereo_mode=stereo_mode, use_mock=USE_MOCK)
+
+            # TODO: How to return analysis_data.json if user requested "retain present format" (XML)?
+            # We will stick to returning XML as the body.
+            # Optionally, we could attach JSON in a header, but that might be too large.
+            # Or we could return a multipart response, but that changes the format.
+            # We follow "retain present format" strict interpretation: Body is XML.
+
+            # We can log the analysis data for debugging
+            # print(json.dumps(result.analysis_data.to_dict(), indent=2))
+
+            return Response(content=result.musicxml, media_type="application/xml")
 
         finally:
             # Cleanup uploaded file
@@ -46,6 +64,7 @@ async def transcribe(file: UploadFile = File(...)):
 
     except Exception as e:
         print(f"API Error: {e}")
+        # Return 500
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
