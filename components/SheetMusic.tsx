@@ -1,6 +1,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import * as OSMDModule from 'opensheetmusicdisplay';
+import { NoteEvent, AlternativePitch } from '../types';
 
 // Robust import handling for OSMD to support various build environments (ESM/CJS)
 const getOSMDClass = () => {
@@ -17,16 +18,21 @@ const OpenSheetMusicDisplay = getOSMDClass();
 
 interface SheetMusicProps {
   musicXML?: string; // Content string
+  transcribedNotes?: NoteEvent[];
   currentTime?: number;
   bpm?: number;
 }
 
 const SheetMusic: React.FC<SheetMusicProps> = ({ 
-    musicXML, currentTime, bpm = 120
+    musicXML, transcribedNotes = [], currentTime, bpm = 120
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const osmdRef = useRef<any>(null);
   const [isReady, setIsReady] = useState(false);
+
+  // Floating Option Icon State
+  const [activeAlternatives, setActiveAlternatives] = useState<AlternativePitch[]>([]);
+  const [cursorPos, setCursorPos] = useState<{top: number, left: number} | null>(null);
 
   // Initialize OSMD
   useEffect(() => {
@@ -120,16 +126,62 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                       cursor.next();
                       steps++;
                   }
+
+                  // --- Option Icon Logic ---
+                  // 1. Get current visual cursor position
+                  if (cursor.cursorElement) {
+                      const rect = cursor.cursorElement.getBoundingClientRect();
+                      const containerRect = containerRef.current?.getBoundingClientRect();
+
+                      if (rect && containerRect) {
+                          // Relative position inside the container
+                          const top = rect.top - containerRect.top;
+                          const left = rect.left - containerRect.left;
+                          setCursorPos({ top, left: left + 15 }); // Offset slightly to the right
+                      }
+                  }
+
+                  // 2. Check for alternatives
+                  // Find the note that is currently playing or nearest
+                  // We use currentTime
+                  const activeNote = transcribedNotes.find(n =>
+                      currentTime >= n.start_time && currentTime < (n.start_time + n.duration)
+                  );
+
+                  if (activeNote && activeNote.alternatives && activeNote.alternatives.length > 0) {
+                      setActiveAlternatives(activeNote.alternatives);
+                  } else {
+                      setActiveAlternatives([]);
+                  }
               }
           } catch(e) {
               // Ignore cursor errors during seek
           }
       }
-  }, [currentTime, isReady, musicXML, bpm]);
+  }, [currentTime, isReady, musicXML, bpm, transcribedNotes]);
 
   return (
-    <div className="w-full h-full min-h-[400px] overflow-auto bg-white rounded-xl shadow-sm p-4">
-        <div ref={containerRef} className="w-full h-full" />
+    <div className="w-full h-full min-h-[400px] overflow-auto bg-white rounded-xl shadow-sm p-4 relative">
+        <div ref={containerRef} className="w-full h-full relative" />
+
+        {/* Floating Option Icon */}
+        {cursorPos && activeAlternatives.length > 0 && (
+            <div
+                style={{ top: cursorPos.top, left: cursorPos.left }}
+                className="absolute z-20 flex flex-col gap-1 animate-in fade-in slide-in-from-left-1 duration-200"
+            >
+                {activeAlternatives.map((alt, idx) => (
+                    <div
+                        key={idx}
+                        className="flex items-center gap-1.5 bg-indigo-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-lg border border-white/20 hover:scale-105 transition-transform cursor-pointer"
+                        title={`Alternative Source: ${alt.source} (Confidence: ${(alt.confidence * 100).toFixed(0)}%)`}
+                    >
+                        <span className="uppercase">{alt.source === 'hpss' ? 'H' : 'Alt'}</span>
+                        <span className="opacity-80 font-mono">{alt.midi}</span>
+                    </div>
+                ))}
+            </div>
+        )}
     </div>
   );
 };

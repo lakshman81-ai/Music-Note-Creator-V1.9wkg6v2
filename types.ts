@@ -7,6 +7,12 @@ export enum NoteDuration {
   SIXTEENTH = "1/16"
 }
 
+export interface AlternativePitch {
+  midi: number;
+  confidence: number;
+  source: string;
+}
+
 export interface NoteEvent {
   // Raw / Analysis Data
   id: string;
@@ -34,6 +40,7 @@ export interface NoteEvent {
   isUncertain?: boolean;
   quantizeErrorBeats?: number;
   remediationFlags?: string[];
+  alternatives?: AlternativePitch[];
 }
 
 export interface ChordEvent {
