@@ -7,7 +7,7 @@ import os
 import tempfile
 from typing import Optional
 
-from backend.transcription import transcribe_audio_pipeline, transcribe_audio
+from transcription import transcribe_audio_pipeline, transcribe_audio
 
 app = FastAPI()
 
