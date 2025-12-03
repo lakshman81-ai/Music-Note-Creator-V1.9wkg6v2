@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-from typing import Any
-
 import os
-import tempfile
 import shutil
+import tempfile
 
 from pipeline.stage_a import load_and_preprocess
 from pipeline.stage_b import extract_features
 from pipeline.stage_c import apply_theory
 from pipeline.stage_d import quantize_and_render
 from pipeline.models import AnalysisData, TranscriptionResult, MetaData
-
 
 
 def transcribe_audio_pipeline(
@@ -30,7 +27,6 @@ def transcribe_audio_pipeline(
         Stage C: apply_theory (dynamics, grace, key)
         Stage D: quantize_and_render (MusicXML)
     """
-    # Mock path: return static XML (if you want to keep your previous behavior)
     if use_mock:
         from pathlib import Path
 
