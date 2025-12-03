@@ -7,7 +7,7 @@ import soundfile as sf
 import pyloudnorm as pyln
 import librosa
 
-from backend.pipeline.models import MetaData
+from .models import MetaData
 
 
 TARGET_SR = 22050
