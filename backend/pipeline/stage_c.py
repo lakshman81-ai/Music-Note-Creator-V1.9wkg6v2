@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List
 
-from backend.pipeline.models import NoteEvent, AnalysisData
+from .models import NoteEvent, AnalysisData
 
 
 MIN_NOTE_DURATION = 0.1  # seconds
