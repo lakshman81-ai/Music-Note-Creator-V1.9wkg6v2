@@ -11,7 +11,7 @@ from music21 import (
     metadata as m21meta,
 )
 
-from backend.pipeline.models import NoteEvent, AnalysisData, VexflowLayout
+from .models import NoteEvent, AnalysisData, VexflowLayout
 
 
 def _quantize_notes_to_beats(
