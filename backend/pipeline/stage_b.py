@@ -6,13 +6,14 @@ import numpy as np
 import librosa
 import scipy.signal  # reserved for future use
 
-from backend.pipeline.models import (
+from .models import (
     MetaData,
     FramePitch,
     NoteEvent,
     ChordEvent,
     AlternativePitch,
 )
+
 
 # We explicitly disable BasicPitch for now
 BASIC_PITCH_AVAILABLE = False
