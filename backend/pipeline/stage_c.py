@@ -1,77 +1,67 @@
-from typing import List
-from backend.pipeline.models import NoteEvent, MetaData, AnalysisData
+from __future__ import annotations
 
-def apply_theory(events: List[NoteEvent], analysis_data: AnalysisData):
+from typing import List
+
+from backend.pipeline.models import NoteEvent, AnalysisData
+
+
+MIN_NOTE_DURATION = 0.1  # seconds
+
+
+def _mark_grace_notes(events: List[NoteEvent]) -> None:
+    """
+    Mark very short notes as grace notes.
+    """
+    for e in events:
+        if (e.end_sec - e.start_sec) < MIN_NOTE_DURATION:
+            e.is_grace = True
+
+
+def _assign_dynamics(events: List[NoteEvent]) -> None:
+    """
+    Map confidence -> dynamic marking.
+    """
+    for e in events:
+        if e.confidence > 0.9:
+            e.dynamic = "f"
+        elif e.confidence > 0.7:
+            e.dynamic = "mf"
+        else:
+            e.dynamic = "p"
+
+
+def _estimate_key(events: List[NoteEvent], analysis_data: AnalysisData) -> None:
+    """
+    Rough key estimation from pitch class histogram.
+    """
+    meta = analysis_data.meta
+    if not events:
+        meta.detected_key = "C"
+        return
+
+    pcs = [(e.midi_note % 12) for e in events]
+    counts = [0] * 12
+    for pc in pcs:
+        counts[pc] += 1
+
+    names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    tonic_index = int(max(range(12), key=lambda i: counts[i]))
+    meta.detected_key = names[tonic_index]
+
+
+def apply_theory(events: List[NoteEvent], analysis_data: AnalysisData) -> List[NoteEvent]:
     """
     Stage C: Music Theory Logic
 
-    1. Grace Note Detection
-    2. Enharmonic Spelling
-    3. Dynamics
+    1. Grace note detection
+    2. Dynamics mapping
+    3. Key estimation
     """
-
-    MIN_NOTE_DURATION = 0.1
-
     sorted_events = sorted(events, key=lambda e: e.start_sec)
 
-    # C1. Grace Note Detection
-    for i, event in enumerate(sorted_events):
-        duration = event.end_sec - event.start_sec
+    _mark_grace_notes(sorted_events)
+    _assign_dynamics(sorted_events)
+    _estimate_key(sorted_events, analysis_data)
 
-        # Check if duration is short
-        if duration < MIN_NOTE_DURATION:
-            # Check if precedes a strong note (next note starts very soon after this ends)
-            is_grace = False
-            if i + 1 < len(sorted_events):
-                next_event = sorted_events[i+1]
-                gap = next_event.start_sec - event.end_sec
-                if gap < 0.05: # Very close
-                     is_grace = True
-
-            if is_grace:
-                event.type = "grace"
-                # "NOT deleted" - we just mark it.
-
-    # C2. Enharmonic Spelling
-    # "Use key context to choose F# vs Gb"
-    # Current detected key is in analysis_data.meta.detected_key
-    key_name = analysis_data.meta.detected_key
-
-    # Simple dictionary for key preferences
-    # Flat keys: F, Bb, Eb, Ab, Db, Gb, Cb
-    # Sharp keys: G, D, A, E, B, F#, C#
-    flat_keys = ["F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb", "Fm", "Bbm", "Ebm"] # etc.
-    use_flats = key_name in flat_keys
-
-    # Note: MIDI doesn't store spelling. We apply this during MusicXML generation (Stage D) or store a hint.
-    # We'll rely on music21 in Stage D to handle this mostly, but we could store a 'spelling' hint.
-
-    # We can explicitly set the spelling hint if possible, or we just trust Music21's key analysis.
-    # But the requirement says "Use key context to choose F# vs Gb".
-    # Music21's key context usually handles this, but we can force it if we were converting to pitch names.
-    # Since NoteEvent uses MIDI, we can't change the number.
-    # However, we can store a hint in `tuplet_info` (hack) or a new field if we updated the model.
-    # Or we can just ensure the Key signature passed to Music21 is correct, which we do in Stage D.
-
-    # Let's perform a check: if we have a detected key, we update the metadata to be precise.
-    # (e.g. if we detected 'F#', but it's logically 'Gb', we flip it).
-    # Since we don't have a sophisticated key analysis here (just 'C' or from Meta), we'll skip complex enharmonic logic
-    # that would modify the MIDI itself (impossible).
-    # We will assume Stage D uses the key signature to spell notes.
-    pass
-
-    # C3. Dynamics
-    # Map amplitude -> dynamics
-    # We don't have per-note amplitude in NoteEvent yet (mocked as 0.0).
-    # If we had it (from Basic Pitch or CREPE), we would map it.
-    # Let's assume amplitude is populated or we infer it.
-    for event in events:
-        # Placeholder logic
-        if event.confidence > 0.9:
-            event.dynamic = "f"
-        elif event.confidence > 0.7:
-            event.dynamic = "mf"
-        else:
-            event.dynamic = "p"
-
+    analysis_data.events = sorted_events
     return sorted_events
