@@ -6,11 +6,12 @@ import os
 import tempfile
 import shutil
 
-from backend.pipeline.stage_a import load_and_preprocess
-from backend.pipeline.stage_b import extract_features
-from backend.pipeline.stage_c import apply_theory
-from backend.pipeline.stage_d import quantize_and_render
-from backend.pipeline.models import AnalysisData, TranscriptionResult, MetaData
+from pipeline.stage_a import load_and_preprocess
+from pipeline.stage_b import extract_features
+from pipeline.stage_c import apply_theory
+from pipeline.stage_d import quantize_and_render
+from pipeline.models import AnalysisData, TranscriptionResult, MetaData
+
 
 
 def transcribe_audio_pipeline(
