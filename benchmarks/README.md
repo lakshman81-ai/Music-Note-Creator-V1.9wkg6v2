@@ -1,6 +1,6 @@
 # Benchmark Plan
 
-This directory holds reusable fixtures and notes for evaluating the transcription pipeline. Use the structure and checklists below to keep inputs, ground truths, and timing results consistent across scenarios. See [`PLAN_GENERATED_NOTES.md`](./PLAN_GENERATED_NOTES.md) for a dedicated plan on benchmarking generated music note outputs against references.
+This directory holds reusable fixtures and notes for evaluating the transcription pipeline. Use the structure and checklists below to keep inputs, ground truths, and timing results consistent across scenarios.
 
 ## Directory layout
 
