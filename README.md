@@ -28,17 +28,4 @@ import { generateChildMelody } from './utils/childMelodyGenerator';
 
 const { melody, tempo } = generateChildMelody({ seed: 42 });
 // melody: "C4 q, D4 q, E4 h, ..." and tempo defaults to 90 bpm
-// phrases now cadence to C4 and use only pitches drawn from the helper's C-major scale
-```
-
-Options you can tweak:
-
-- `bars` (default 4): change the number of bars in the generated phrase.
-- `ensureLeap` (default true): inject a single decorative leap that immediately resolves stepwise.
-- `ensureEighthNotes` (default true): guarantee at least one bar contains eighth-note motion.
-
-Quick benchmark (requires `ts-node` or similar):
-
-```bash
-npx ts-node scripts/benchmarkChildMelody.ts 30
 ```

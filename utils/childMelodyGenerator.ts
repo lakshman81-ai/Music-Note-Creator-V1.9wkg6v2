@@ -8,12 +8,9 @@ export interface MelodyNote {
 interface GeneratorOptions {
   seed?: number;
   tempo?: number;
-  bars?: number;
-  ensureLeap?: boolean;
-  ensureEighthNotes?: boolean;
 }
 
-const scale: string[] = ['C4', 'D4', 'E4', 'F4', 'G4', 'A4', 'B4', 'C5', 'E5', 'G5'];
+const scale: string[] = ['C4', 'D4', 'E4', 'F4', 'G4', 'A4', 'B4', 'C5'];
 
 const rhythmPatterns: NoteDuration[][] = [
   ['q', 'q', 'q', 'q'],
@@ -22,11 +19,7 @@ const rhythmPatterns: NoteDuration[][] = [
   ['h', 'h'],
   ['e', 'e', 'q', 'q', 'q'],
   ['q', 'e', 'e', 'q', 'q'],
-  ['q', 'q', 'e', 'e', 'q'],
-  ['e', 'q', 'e', 'q', 'q'],
 ];
-const rhythmPatternsWithEighth = rhythmPatterns.filter((pattern) => pattern.includes('e'));
-const rhythmPatternsWithoutEighth = rhythmPatterns.filter((pattern) => !pattern.includes('e'));
 
 function mulberry32(seed: number): () => number {
   return function random() {
@@ -38,8 +31,10 @@ function mulberry32(seed: number): () => number {
 }
 
 function pickStrongTone(random: () => number): string {
-  const strongScalePitches = scale.filter((pitch) => ['C', 'E', 'G'].includes(pitch[0]));
-  return strongScalePitches[Math.floor(random() * strongScalePitches.length)];
+  const strongTones = ['C', 'E', 'G'];
+  const octave = random() > 0.6 ? '5' : '4';
+  const tone = strongTones[Math.floor(random() * strongTones.length)];
+  return `${tone}${octave}`;
 }
 
 function clampIndex(index: number): number {
@@ -54,22 +49,12 @@ function pickNextIndex(currentIndex: number, random: () => number): number {
   return clampIndex(currentIndex + choice);
 }
 
-function chooseRhythm(random: () => number, requireEighth: boolean, allowEighths: boolean): NoteDuration[] {
-  const options = requireEighth
-    ? rhythmPatternsWithEighth
-    : allowEighths
-      ? rhythmPatterns
-      : rhythmPatternsWithoutEighth;
-  return options[Math.floor(random() * options.length)];
+function chooseRhythm(random: () => number): NoteDuration[] {
+  return rhythmPatterns[Math.floor(random() * rhythmPatterns.length)];
 }
 
-function barToNotes(
-  baseIndex: number,
-  random: () => number,
-  mustUseEighths: boolean,
-  allowEighths: boolean,
-): { notes: MelodyNote[]; nextIndex: number; usedEighths: boolean } {
-  const rhythm = chooseRhythm(random, mustUseEighths, allowEighths);
+function barToNotes(baseIndex: number, random: () => number): { notes: MelodyNote[]; nextIndex: number } {
+  const rhythm = chooseRhythm(random);
   const notes: MelodyNote[] = [];
   let currentIndex = baseIndex;
 
@@ -85,65 +70,21 @@ function barToNotes(
     notes.push({ pitch: scale[currentIndex], duration });
   });
 
-  return { notes, nextIndex: currentIndex, usedEighths: rhythm.some((value) => value === 'e') };
+  return { notes, nextIndex: currentIndex };
 }
 
-function injectDecorativeLeap(melody: MelodyNote[], random: () => number): void {
-  const candidates = melody
-    .map((note, idx) => ({ idx, scaleIndex: scale.indexOf(note.pitch) }))
-    .filter(({ idx, scaleIndex }) => idx < melody.length - 2 && scaleIndex >= 0 && scaleIndex < scale.length - 2);
-
-  if (candidates.length === 0) return;
-
-  const choice = candidates[Math.floor(random() * candidates.length)];
-  const leapTargets = [choice.scaleIndex + 2, choice.scaleIndex + 3]
-    .map((target) => clampIndex(target))
-    .filter((target) => target > choice.scaleIndex);
-
-  if (leapTargets.length === 0) return;
-
-  const targetIndex = leapTargets[Math.floor(random() * leapTargets.length)];
-  melody[choice.idx].pitch = scale[targetIndex];
-
-  const landingIndex = Math.max(0, targetIndex - 1);
-  melody[choice.idx + 1].pitch = scale[landingIndex];
-}
-
-export function generateChildMelody({
-  seed,
-  tempo = 90,
-  bars = 4,
-  ensureLeap = true,
-  ensureEighthNotes = true,
-}: GeneratorOptions = {}): { melody: string; tempo: number } {
+export function generateChildMelody({ seed, tempo = 90 }: GeneratorOptions = {}): { melody: string; tempo: number } {
   const random = mulberry32(seed ?? Date.now());
   let currentIndex = 0;
   const melody: MelodyNote[] = [];
-  let usedEighths = false;
-  const allowEighths = ensureEighthNotes;
 
-  for (let bar = 0; bar < bars; bar++) {
-    const barsRemaining = bars - bar;
-    const mustUseEighths = ensureEighthNotes
-      ? (!usedEighths && barsRemaining === 1) || (!usedEighths && random() > 0.5) || (usedEighths && random() > 0.2)
-      : false;
-
-    const { notes, nextIndex, usedEighths: usedThisBar } = barToNotes(
-      currentIndex,
-      random,
-      mustUseEighths,
-      allowEighths,
-    );
+  for (let bar = 0; bar < 4; bar++) {
+    const { notes, nextIndex } = barToNotes(currentIndex, random);
     melody.push(...notes);
     currentIndex = nextIndex;
-    usedEighths = usedEighths || usedThisBar;
   }
 
-  if (ensureLeap) {
-    injectDecorativeLeap(melody, random);
-  }
-
-  melody[melody.length - 1] = { pitch: 'C4', duration: melody[melody.length - 1].duration };
+  melody[melody.length - 1] = { pitch: 'C5', duration: melody[melody.length - 1].duration };
 
   const melodyLine = melody.map((note) => `${note.pitch} ${note.duration}`).join(', ');
   return { melody: melodyLine, tempo };
