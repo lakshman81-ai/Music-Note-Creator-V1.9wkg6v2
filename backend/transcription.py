@@ -3,12 +3,33 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+from typing import Callable
 
-from pipeline.stage_a import load_and_preprocess
-from pipeline.stage_b import extract_features
-from pipeline.stage_c import apply_theory
-from pipeline.stage_d import quantize_and_render
-from pipeline.models import AnalysisData, TranscriptionResult, MetaData
+from backend.pipeline.models import AnalysisData, TranscriptionResult, MetaData
+
+
+def _load_pipeline_stages() -> tuple[
+    Callable,
+    Callable,
+    Callable,
+    Callable,
+]:
+    """
+    Lazily import heavy pipeline dependencies so mock-mode can run
+    without requiring audio libraries to be installed.
+    """
+
+    from backend.pipeline.stage_a import load_and_preprocess
+    from backend.pipeline.stage_b import extract_features
+    from backend.pipeline.stage_c import apply_theory
+    from backend.pipeline.stage_d import quantize_and_render
+
+    return (
+        load_and_preprocess,
+        extract_features,
+        apply_theory,
+        quantize_and_render,
+    )
 
 
 def transcribe_audio_pipeline(
@@ -34,6 +55,13 @@ def transcribe_audio_pipeline(
         musicxml = xml_path.read_text(encoding="utf-8")
         analysis_data = AnalysisData(meta=MetaData())
         return TranscriptionResult(musicxml=musicxml, analysis_data=analysis_data)
+
+    (
+        load_and_preprocess,
+        extract_features,
+        apply_theory,
+        quantize_and_render,
+    ) = _load_pipeline_stages()
 
     tmp_dir = tempfile.mkdtemp(prefix="mnc_")
     try:
