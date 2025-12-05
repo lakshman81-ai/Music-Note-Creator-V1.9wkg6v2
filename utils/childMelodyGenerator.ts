@@ -10,7 +10,7 @@ interface GeneratorOptions {
   tempo?: number;
 }
 
-const scale: string[] = ['C4', 'D4', 'E4', 'F4', 'G4', 'A4', 'B4', 'C5', 'E5', 'G5'];
+const scale: string[] = ['C4', 'D4', 'E4', 'F4', 'G4', 'A4', 'B4', 'C5'];
 
 const rhythmPatterns: NoteDuration[][] = [
   ['q', 'q', 'q', 'q'],
@@ -31,8 +31,10 @@ function mulberry32(seed: number): () => number {
 }
 
 function pickStrongTone(random: () => number): string {
-  const strongScalePitches = scale.filter((pitch) => ['C', 'E', 'G'].includes(pitch[0]));
-  return strongScalePitches[Math.floor(random() * strongScalePitches.length)];
+  const strongTones = ['C', 'E', 'G'];
+  const octave = random() > 0.6 ? '5' : '4';
+  const tone = strongTones[Math.floor(random() * strongTones.length)];
+  return `${tone}${octave}`;
 }
 
 function clampIndex(index: number): number {
@@ -82,7 +84,7 @@ export function generateChildMelody({ seed, tempo = 90 }: GeneratorOptions = {})
     currentIndex = nextIndex;
   }
 
-  melody[melody.length - 1] = { pitch: 'C4', duration: melody[melody.length - 1].duration };
+  melody[melody.length - 1] = { pitch: 'C5', duration: melody[melody.length - 1].duration };
 
   const melodyLine = melody.map((note) => `${note.pitch} ${note.duration}`).join(', ');
   return { melody: melodyLine, tempo };

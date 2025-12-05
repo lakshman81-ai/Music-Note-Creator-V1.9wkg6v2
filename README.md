@@ -28,5 +28,4 @@ import { generateChildMelody } from './utils/childMelodyGenerator';
 
 const { melody, tempo } = generateChildMelody({ seed: 42 });
 // melody: "C4 q, D4 q, E4 h, ..." and tempo defaults to 90 bpm
-// phrases now cadence to C4 and use only pitches drawn from the helper's C-major scale
 ```
