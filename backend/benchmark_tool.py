@@ -4,6 +4,7 @@ import sys
 import glob
 import numpy as np
 import music21
+import tempfile
 from typing import List, Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field

@@ -32,7 +32,7 @@ def test_load_and_preprocess_success(mock_audio_file):
     assert isinstance(meta, MetaData)
     assert meta.duration_sec >= 1.0
     assert y.ndim == 1
-    assert np.abs(meta.lufs - (-14.0)) < 1.0 # Should be normalized to near -14
+    assert np.abs(meta.lufs - (-23.0)) < 1.0 # Should be normalized to near -23 (EBU R128)
 
 def test_load_short_file(tmp_path):
     import soundfile as sf
