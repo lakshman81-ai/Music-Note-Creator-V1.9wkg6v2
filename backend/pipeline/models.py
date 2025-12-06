@@ -30,6 +30,13 @@ class MetaData:
     target_sr: int = 22050
     duration_sec: float = 0.0
 
+    # Extended robust fields
+    audio_path: Optional[str] = None
+    n_channels: int = 1
+    normalization_gain_db: float = 0.0
+    rms_db: float = -float('inf')
+    pipeline_version: str = "2.0.0"
+
 
 # ---------- Pitch timeline ----------
 
@@ -94,6 +101,13 @@ class VexflowLayout:
 # ---------- All analysis data ----------
 
 @dataclass
+class BenchmarkResult:
+    pitch_accuracy_score: float = 0.0
+    rhythm_accuracy_score: float = 0.0
+    metrics: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class AnalysisData:
     meta: MetaData = field(default_factory=MetaData)
     timeline: List[FramePitch] = field(default_factory=list)
@@ -103,6 +117,13 @@ class AnalysisData:
 
     # New fields
     notes: List[NoteEvent] = field(default_factory=list)
+
+    # Extended robust fields
+    pitch_tracker: str = "pyin"  # "pyin" | "crepe"
+    n_frames: int = 0
+    frame_hop_seconds: float = 0.0
+    notes_before_quantization: List[NoteEvent] = field(default_factory=list)
+    benchmark: Optional[BenchmarkResult] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """

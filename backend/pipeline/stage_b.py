@@ -18,7 +18,7 @@ def extract_features(
     use_crepe: bool = False,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """
-    Stage B: Pitch tracking and note segmentation.
+    Stage B: Pitch tracking and note segmentation using Hysteresis (Method B).
     """
     hop_length = meta.hop_length
 
@@ -26,243 +26,168 @@ def extract_features(
     time_points = None
     f0 = None
     confidence = None
+    tracker_name = "pyin"
 
-    # Try CREPE if requested
+    # Try CREPE
     crepe_success = False
     if use_crepe:
         try:
             import crepe
-            # Crepe expects 16kHz usually
             sr_crepe = 16000
             y_crepe = librosa.resample(y, orig_sr=sr, target_sr=sr_crepe)
-
             step_size_ms = (hop_length / sr) * 1000
-
             time_points, f0, confidence, _ = crepe.predict(
-                y_crepe,
-                sr_crepe,
-                viterbi=True,
-                step_size=step_size_ms,
-                verbose=0
+                y_crepe, sr_crepe, viterbi=True, step_size=step_size_ms, verbose=0
             )
             crepe_success = True
+            tracker_name = "crepe"
         except ImportError:
-            print("CREPE requested but not installed. Falling back to librosa.pyin.")
+            pass
         except Exception as e:
-            print(f"CREPE failed: {e}. Falling back to librosa.pyin.")
+            print(f"CREPE failed: {e}. Falling back to pyin.")
 
     if not crepe_success:
-        # Use librosa.pyin
-        fmin = librosa.note_to_hz("A1") # ~55 Hz
-        fmax = librosa.note_to_hz("C7") # ~2093 Hz
+        tracker_name = "pyin"
+        fmin = librosa.note_to_hz("C1")  # ~32 Hz
+        fmax = librosa.note_to_hz("C7")  # ~2093 Hz
 
         f0, voiced_flag, voiced_probs = librosa.pyin(
-            y,
-            fmin=fmin,
-            fmax=fmax,
-            sr=sr,
-            hop_length=hop_length,
-            fill_na=0.0
+            y, fmin=fmin, fmax=fmax, sr=sr, hop_length=hop_length, fill_na=0.0
         )
-        # Create time points
-        times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
-
-        # Align arrays
-        time_points = times
+        time_points = librosa.times_like(f0, sr=sr, hop_length=hop_length)
         confidence = voiced_probs
 
     # 2. Build Timeline
     timeline: List[FramePitch] = []
 
+    # Pre-calculate midi values for segmentation
+    midi_trace = []
+
     for t, f, c in zip(time_points, f0, confidence):
         p_hz = float(f)
-        if np.isnan(p_hz) or p_hz < 10.0: # Filter low freq noise/unvoiced
+        if np.isnan(p_hz) or p_hz < 20.0:
             p_hz = 0.0
-            midi_val = None
+            m_val = None
         else:
-            midi_val = int(round(hz_to_midi(p_hz)))
+            m_val = hz_to_midi(p_hz)
 
         timeline.append(FramePitch(
             time=float(t),
             pitch_hz=p_hz,
-            midi=midi_val,
+            midi=int(round(m_val)) if m_val is not None else None,
             confidence=float(c)
         ))
 
-    # 3. Note Segmentation
+        # Store exact midi float for analysis
+        midi_trace.append(m_val)
+
+    # 3. Note Segmentation (Hysteresis Method)
+    # Rules:
+    # - Start note if confidence > high_thresh AND pitch is stable.
+    # - Continue note if confidence > low_thresh AND pitch is close to current note pitch.
+    # - End note if confidence < low_thresh OR pitch jumps.
+
     notes: List[NoteEvent] = []
 
-    current_start_time = None
-    current_midi_values = []
-    current_confidences = []
+    # Parameters
+    high_conf_thresh = 0.6
+    low_conf_thresh = 0.3 # Hysteresis floor
+
+    # Pitch jump
+    pitch_jump_thresh = 0.7 # semitones
+
+    # State
+    active_note_start = None
+    active_pitches = []
+    active_confidences = []
+    active_pitch_ref = None # The pitch we are tracking (median of recent)
 
     min_duration = 0.06 # 60ms
-    pitch_change_thresh = 0.7
 
-    for frame in timeline:
-        is_voiced = frame.midi is not None and frame.pitch_hz > 0
+    for i, frame in enumerate(timeline):
+        curr_midi = midi_trace[i]
+        curr_conf = frame.confidence
 
-        if is_voiced:
-            curr_midi_float = hz_to_midi(frame.pitch_hz)
-
-            if current_start_time is None:
-                # Start new note
-                current_start_time = frame.time
-                current_midi_values = [curr_midi_float]
-                current_confidences = [frame.confidence]
-            else:
-                # Compare against the median of the current note so far
-                # Using median is more robust than just checking the last frame,
-                # especially if pyin is jumping around a bit.
-                # But requirement says "pitch jumps more than ~0.5-0.7 MIDI".
-                # If I use median, it might smooth out a real jump if the jump just happened.
-                # Let's try checking against the last few frames median or just the last frame.
-                # My previous implementation checked against last frame.
-                # Debug output showed transitions were found but notes were 1.
-                # This means I called `_finalize_note` but it didn't seem to split correctly?
-                # Ah, wait. In the loop:
-                # if abs(...) > thresh:
-                #    finalize(...)
-                #    start NEW note
-                #
-                # If `_finalize_note` appends to `notes`, then `notes` should grow.
-                # The debug output said "Total transitions found: 12".
-                # But "Notes detected: 1".
-                # This means `_finalize_note` was called, but maybe `min_duration` check failed?
-                # Or maybe my logic for `current_midi_values` reset was wrong?
-                #
-                # Let's look closely at the previous code:
-                # _finalize_note(notes, current_start_time, frame.time, current_midi_values, ...)
-                # current_start_time = frame.time
-                # current_midi_values = [curr_midi_float]
-                #
-                # This looks correct.
-                #
-                # Why did it yield only 1 note?
-                # Maybe `min_duration` is too aggressive?
-                # The scale is 0.5s per note. 60ms is 0.06s. Should be fine.
-                #
-                # Let's re-read the debug output.
-                # "Transition at t=0.48: 60 -> 61"
-                # "Transition at t=0.51: 61 -> 62"
-                # It seems pyin is outputting intermediate pitches during the glide/step?
-                # 60 -> 61 -> 62.
-                # The jump 60->61 is 1 semitone > 0.7. So it should split.
-                # Duration 0.0 -> 0.48 is 0.48s > 0.06s. So it should save.
-                #
-                # Wait, I see what happened.
-                # The debug loop iterates `voiced_frames`.
-                # The real loop iterates `timeline`.
-                # If there are unvoiced frames in between, it breaks the note.
-                #
-                # The issue might be `current_midi_values` logic.
-                # "Note: 67 (392.0Hz) 0.00-4.05s"
-                # This note spans the ENTIRE file.
-                # This implies `current_start_time` was set at 0.00 and never reset until the end?
-                # OR, `_finalize_note` was called but somehow didn't append? No, it appends.
-                #
-                # If `current_start_time` was never reset, then the `if abs(...) > thresh` block was NEVER entered.
-                # But `voiced_frames` debug loop found transitions!
-                #
-                # Difference:
-                # Debug loop: `if f.midi != prev.midi` (integer comparison)
-                # Code loop: `abs(curr_midi_float - last_midi_float) > pitch_change_thresh` (float comparison)
-                #
-                # `last_midi_float` comes from `current_midi_values[-1]`.
-                # `current_midi_values` stores `hz_to_midi(frame.pitch_hz)` (float).
-                # `frame.midi` (int) is `round(hz_to_midi(...))`.
-                #
-                # If `pyin` returns very smooth frequency changes, e.g. 261.6 -> 261.7 -> 261.8 ...
-                # The integer `round` might jump 60 -> 61.
-                # But the float difference might be small per step if `hop_length` is small.
-                # `hop_length` 256 @ 22050 is ~11ms.
-                # If the transition is instantaneous (synthetic audio), `pyin` might smear it over a window.
-                # But `pyin` shouldn't smear it *that* much to avoid a > 0.7 jump between *some* adjacent frames?
-                #
-                # Actually, `pyin` uses a window. If the window overlaps the frequency change, it might output an intermediate frequency.
-                # If the intermediate frequency is close enough to the previous one, we append it.
-                # Then `current_midi_values[-1]` becomes that intermediate value.
-                # Then we compare the *next* frame to that intermediate value.
-                # So we are "chasing" the pitch drift.
-                # We need to compare against the *median of the current note* or the *start of the current note* to detect a shift away from the center?
-                #
-                # "End a note when pitch jumps more than ~0.5–0.7 MIDI".
-                # If I walk up a slope slowly, adjacent differences are small, but I end up far away.
-                # The requirement says "jumps".
-                #
-                # Solution: Compare `curr_midi_float` to `np.median(current_midi_values)` (or simply the note's established pitch).
-                # If `abs(curr - median) > thresh`, then break.
-                # But `median` changes as we add more points.
-                # Better: Compare against the `median` of the *start* or the *bulk* of the note?
-                # Or simply: if the pitch is drifting too far from the average.
-                #
-                # Let's try comparing against `current_midi_values[-1]` (immediate jump) AND `np.median(current_midi_values)` (drift)?
-                # Or just `np.median(current_midi_values)`.
-                #
-                # If I have a stable note at 60. Then I get 60.1, 60.2... (drift).
-                # If I jump to 62.
-                # 60 -> 62 is a big jump.
-                # But if `pyin` gives 60, 60.5, 61, 61.5, 62?
-                # 60->60.5 (diff 0.5) < 0.7. Append.
-                # 60.5->61 (diff 0.5) < 0.7. Append.
-                # This causes the issue: tracking slow transitions.
-                #
-                # To fix:
-                # Compare `curr_midi_float` with `np.round(np.median(current_midi_values))`.
-                # Basically, does this new frame belong to the same integer note bin?
-                # The requirement says: "Segment based on changes in MIDI pitch." "End a note when pitch jumps...".
-                #
-                # If I force a break whenever `round(curr)` != `round(median)`?
-                # But we want to allow vibrato (which might cross boundaries slightly? No, usually stays within semitone).
-                #
-                # Let's stick to the requirement: "End a note when pitch jumps more than ~0.5–0.7 MIDI".
-                # This usually implies adjacent frames.
-                # But to avoid the "walking" issue, I should also check if the *rounded MIDI* has changed significantly.
-                #
-                # Let's try:
-                # `if abs(curr_midi_float - current_midi_values[-1]) > pitch_change_thresh`: break
-                # AND
-                # `if abs(curr_midi_float - np.mean(current_midi_values)) > pitch_change_thresh`: break (drift check)
-
-                # Let's implement the drift check.
-
-                last_midi_float = current_midi_values[-1]
-                avg_midi = np.mean(current_midi_values) # use mean for speed/smoothness
-
-                if abs(curr_midi_float - last_midi_float) > pitch_change_thresh or \
-                   abs(curr_midi_float - avg_midi) > pitch_change_thresh:
-                       # Split
-                       _finalize_note(notes, current_start_time, frame.time, current_midi_values, current_confidences, min_duration)
-                       current_start_time = frame.time
-                       current_midi_values = [curr_midi_float]
-                       current_confidences = [frame.confidence]
-                else:
-                       current_midi_values.append(curr_midi_float)
-                       current_confidences.append(frame.confidence)
-
+        if active_note_start is None:
+            # Look for start
+            if curr_midi is not None and curr_conf >= high_conf_thresh:
+                active_note_start = frame.time
+                active_pitches = [curr_midi]
+                active_confidences = [curr_conf]
+                active_pitch_ref = curr_midi
         else:
-            # Silence gap
-            if current_start_time is not None:
-                _finalize_note(notes, current_start_time, frame.time, current_midi_values, current_confidences, min_duration)
-                current_start_time = None
-                current_midi_values = []
-                current_confidences = []
+            # Check for continue
+            should_continue = False
 
-    # Finalize if active at end
-    if current_start_time is not None and len(current_midi_values) > 0:
-        end_time = timeline[-1].time
-        _finalize_note(notes, current_start_time, end_time, current_midi_values, current_confidences, min_duration)
+            if curr_midi is not None:
+                # 1. Confidence check
+                if curr_conf >= low_conf_thresh:
+                    # 2. Pitch jump check
+                    # Compare against running average or reference
+                    # Let's compare against the *reference* which locks the note intent
+                    # But we should allow vibrato.
+                    if abs(curr_midi - active_pitch_ref) < pitch_jump_thresh:
+                        should_continue = True
 
-    # 4. Chords
+                        # Update reference slowly? Or keep locked?
+                        # Keeping locked prevents "walking"
+                        # But updating allows glissando?
+                        # Requirement says "segment based on pitch changes", implying we split on gliss.
+                        # So locking is better.
+                    else:
+                        # Pitch jump!
+                        should_continue = False
+                else:
+                    # Confidence dropped
+                    should_continue = False
+            else:
+                # Unvoiced
+                should_continue = False
+
+            if should_continue:
+                active_pitches.append(curr_midi)
+                active_confidences.append(curr_conf)
+            else:
+                # End Note
+                end_time = frame.time
+                # (Or strictly, the previous frame time + duration? Frame time is center usually)
+                # Let's say end is this frame's time (gap starts here)
+
+                _finalize_note_hyst(notes, active_note_start, end_time, active_pitches, active_confidences, min_duration)
+
+                # Try to restart immediately?
+                # If pitch jumped, this frame is valid for a new note if confidence is high
+                active_note_start = None
+                active_pitches = []
+                active_confidences = []
+                active_pitch_ref = None
+
+                if curr_midi is not None and curr_conf >= high_conf_thresh:
+                    active_note_start = frame.time
+                    active_pitches = [curr_midi]
+                    active_confidences = [curr_conf]
+                    active_pitch_ref = curr_midi
+
+    # Finalize last note
+    if active_note_start is not None:
+        _finalize_note_hyst(notes, active_note_start, timeline[-1].time, active_pitches, active_confidences, min_duration)
+
     chords: List[ChordEvent] = []
+
+    # Store tracker info in meta or return it?
+    # The caller expects specific returns.
+    # We can't easily return tracker name here unless we change signature, but we can set it in meta if passed by ref.
+    # But meta is a dataclass instance.
+    # We'll just return standard things. The AnalysisData builder in Orchestrator can handle "pitch_tracker" if we passed it back.
+    # But simpler: the orchestrator knows what it asked for.
 
     return timeline, notes, chords
 
-def _finalize_note(
+def _finalize_note_hyst(
     notes_list: List[NoteEvent],
     start_time: float,
     end_time: float,
-    midi_values: List[float],
+    pitches: List[float],
     confidences: List[float],
     min_duration: float
 ):
@@ -270,9 +195,9 @@ def _finalize_note(
     if duration < min_duration:
         return
 
-    median_midi = np.median(midi_values)
+    median_midi = np.median(pitches)
     rounded_midi = int(round(median_midi))
-    avg_confidence = float(np.mean(confidences))
+    avg_conf = float(np.mean(confidences))
 
     pitch_hz = midi_to_hz(rounded_midi)
 
@@ -281,6 +206,6 @@ def _finalize_note(
         end_sec=end_time,
         midi_note=rounded_midi,
         pitch_hz=pitch_hz,
-        confidence=avg_confidence
+        confidence=avg_conf
     )
     notes_list.append(note)
