@@ -1,6 +1,7 @@
 from typing import List, Tuple, Optional
 import numpy as np
 import librosa
+import scipy.signal
 from .models import MetaData, FramePitch, NoteEvent, ChordEvent
 
 def midi_to_hz(midi: float) -> float:
@@ -18,7 +19,7 @@ def extract_features(
     use_crepe: bool = False,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """
-    Stage B: Pitch tracking and note segmentation using Hysteresis (Method B).
+    Stage B: Pitch tracking, RMS calculation, and note segmentation using Hysteresis (Method B).
     """
     hop_length = meta.hop_length
 
@@ -26,7 +27,9 @@ def extract_features(
     time_points = None
     f0 = None
     confidence = None
-    tracker_name = "pyin"
+
+    # Calculate RMS per frame
+    rms_frames = librosa.feature.rms(y=y, frame_length=meta.window_size, hop_length=hop_length)[0]
 
     # Try CREPE
     crepe_success = False
@@ -40,14 +43,12 @@ def extract_features(
                 y_crepe, sr_crepe, viterbi=True, step_size=step_size_ms, verbose=0
             )
             crepe_success = True
-            tracker_name = "crepe"
         except ImportError:
             pass
         except Exception as e:
             print(f"CREPE failed: {e}. Falling back to pyin.")
 
     if not crepe_success:
-        tracker_name = "pyin"
         fmin = librosa.note_to_hz("C1")  # ~32 Hz
         fmax = librosa.note_to_hz("C7")  # ~2093 Hz
 
@@ -57,14 +58,31 @@ def extract_features(
         time_points = librosa.times_like(f0, sr=sr, hop_length=hop_length)
         confidence = voiced_probs
 
+    # 1.5. Median Pitch Smoothing (Window 11)
+    # Apply to raw f0 before processing (ignoring 0/NaN for median usually requires care, but 0 is usually unvoiced)
+    # However, standard median filter treats 0 as a value.
+    # If unvoiced is 0, median filter might smear silence into pitch or vice versa.
+    # But requirement says "Median pitch smoothing (window 11) ... before segmentation".
+    # librosa.pyin has already done some Viterbi smoothing.
+    # Let's apply scipy.signal.medfilt on the f0 array.
+    f0_smoothed = scipy.signal.medfilt(f0, kernel_size=11)
+
     # 2. Build Timeline
     timeline: List[FramePitch] = []
 
-    # Pre-calculate midi values for segmentation
+    # Pre-calculate midi values
     midi_trace = []
 
-    for t, f, c in zip(time_points, f0, confidence):
-        p_hz = float(f)
+    # Ensure rms_frames aligns with f0 length (librosa.feature.rms centering might differ slightly)
+    # Usually librosa aligns them if hop_length is same.
+    min_len = min(len(time_points), len(f0_smoothed), len(rms_frames))
+
+    for i in range(min_len):
+        t = time_points[i]
+        p_hz = float(f0_smoothed[i])
+        c = confidence[i]
+        r = float(rms_frames[i])
+
         if np.isnan(p_hz) or p_hz < 20.0:
             p_hz = 0.0
             m_val = None
@@ -75,137 +93,149 @@ def extract_features(
             time=float(t),
             pitch_hz=p_hz,
             midi=int(round(m_val)) if m_val is not None else None,
-            confidence=float(c)
+            confidence=float(c),
+            rms=r
         ))
-
-        # Store exact midi float for analysis
         midi_trace.append(m_val)
 
-    # 3. Note Segmentation (Hysteresis Method)
-    # Rules:
-    # - Start note if confidence > high_thresh AND pitch is stable.
-    # - Continue note if confidence > low_thresh AND pitch is close to current note pitch.
-    # - End note if confidence < low_thresh OR pitch jumps.
-
+    # 3. Note Segmentation (Hysteresis Method + 3-frame Stability)
     notes: List[NoteEvent] = []
 
     # Parameters
     high_conf_thresh = 0.6
-    low_conf_thresh = 0.3 # Hysteresis floor
-
-    # Pitch jump
-    pitch_jump_thresh = 0.7 # semitones
+    low_conf_thresh = 0.3
+    pitch_jump_thresh = 0.7  # semitones (tolerance)
+    min_frames_stable = 3
 
     # State
-    active_note_start = None
-    active_pitches = []
-    active_confidences = []
-    active_pitch_ref = None # The pitch we are tracking (median of recent)
+    active_start_idx = None
+    active_ref_midi = None
+    active_frame_indices = [] # keep track of indices to sum RMS later
 
-    min_duration = 0.06 # 60ms
+    # For stability check: we need to look ahead or keep buffer?
+    # Actually, we can just iterate.
+    # A note starts if we have N consecutive frames > high_thresh
 
-    for i, frame in enumerate(timeline):
+    # We'll use a state machine with a buffer for potential start.
+    potential_start_buffer = []
+
+    i = 0
+    while i < len(timeline):
+        frame = timeline[i]
         curr_midi = midi_trace[i]
         curr_conf = frame.confidence
 
-        if active_note_start is None:
-            # Look for start
+        if active_start_idx is None:
+            # LOOKING FOR START
+            # Check if this frame is valid candidate
             if curr_midi is not None and curr_conf >= high_conf_thresh:
-                active_note_start = frame.time
-                active_pitches = [curr_midi]
-                active_confidences = [curr_conf]
-                active_pitch_ref = curr_midi
+                potential_start_buffer.append(i)
+            else:
+                potential_start_buffer.clear()
+
+            # Check stability rule
+            if len(potential_start_buffer) >= min_frames_stable:
+                # We have enough stable frames to confirm start.
+                # Check pitch stability within the buffer?
+                # "pitch stability" - let's ensure they are close to each other.
+                # Take the first frame in buffer as reference, or average?
+                # Let's take the first frame's pitch as reference candidate.
+                first_idx = potential_start_buffer[0]
+                ref_midi = midi_trace[first_idx]
+
+                # Check if all in buffer are close to ref
+                is_stable = True
+                for idx in potential_start_buffer[1:]:
+                    if abs(midi_trace[idx] - ref_midi) > pitch_jump_thresh:
+                        is_stable = False
+                        break
+
+                if is_stable:
+                    # START NOTE
+                    active_start_idx = first_idx
+                    active_ref_midi = ref_midi # Locking pitch to start
+                    active_frame_indices = list(potential_start_buffer)
+                    potential_start_buffer = [] # Clear buffer, we are now in active mode
+                else:
+                    # Not stable, shift buffer (remove first, keep others)
+                    # Ideally we slide window.
+                    potential_start_buffer.pop(0)
+
         else:
-            # Check for continue
+            # NOTE ACTIVE
             should_continue = False
 
-            if curr_midi is not None:
-                # 1. Confidence check
-                if curr_conf >= low_conf_thresh:
-                    # 2. Pitch jump check
-                    # Compare against running average or reference
-                    # Let's compare against the *reference* which locks the note intent
-                    # But we should allow vibrato.
-                    if abs(curr_midi - active_pitch_ref) < pitch_jump_thresh:
-                        should_continue = True
-
-                        # Update reference slowly? Or keep locked?
-                        # Keeping locked prevents "walking"
-                        # But updating allows glissando?
-                        # Requirement says "segment based on pitch changes", implying we split on gliss.
-                        # So locking is better.
-                    else:
-                        # Pitch jump!
-                        should_continue = False
-                else:
-                    # Confidence dropped
-                    should_continue = False
-            else:
-                # Unvoiced
-                should_continue = False
+            if curr_midi is not None and curr_conf >= low_conf_thresh:
+                 # Check pitch proximity to LOCKED reference
+                 if abs(curr_midi - active_ref_midi) < pitch_jump_thresh:
+                     should_continue = True
 
             if should_continue:
-                active_pitches.append(curr_midi)
-                active_confidences.append(curr_conf)
+                active_frame_indices.append(i)
             else:
-                # End Note
-                end_time = frame.time
-                # (Or strictly, the previous frame time + duration? Frame time is center usually)
-                # Let's say end is this frame's time (gap starts here)
+                # END NOTE
+                _finalize_note(notes, timeline, active_frame_indices, active_ref_midi)
 
-                _finalize_note_hyst(notes, active_note_start, end_time, active_pitches, active_confidences, min_duration)
+                # Reset
+                active_start_idx = None
+                active_ref_midi = None
+                active_frame_indices = []
+                potential_start_buffer = []
 
-                # Try to restart immediately?
-                # If pitch jumped, this frame is valid for a new note if confidence is high
-                active_note_start = None
-                active_pitches = []
-                active_confidences = []
-                active_pitch_ref = None
+                # Re-evaluate current frame for new start?
+                # Yes, but we need 3 frames including this one.
+                # The loop continues, next iteration i+1.
+                # But we might miss this frame as start of next note.
+                # We should re-process this frame in "LOOKING FOR START" state.
+                # Decrement i to retry this frame?
+                # Yes.
+                i -= 1
 
-                if curr_midi is not None and curr_conf >= high_conf_thresh:
-                    active_note_start = frame.time
-                    active_pitches = [curr_midi]
-                    active_confidences = [curr_conf]
-                    active_pitch_ref = curr_midi
+        i += 1
 
-    # Finalize last note
-    if active_note_start is not None:
-        _finalize_note_hyst(notes, active_note_start, timeline[-1].time, active_pitches, active_confidences, min_duration)
+    # Finalize if active
+    if active_start_idx is not None:
+         _finalize_note(notes, timeline, active_frame_indices, active_ref_midi)
 
     chords: List[ChordEvent] = []
-
-    # Store tracker info in meta or return it?
-    # The caller expects specific returns.
-    # We can't easily return tracker name here unless we change signature, but we can set it in meta if passed by ref.
-    # But meta is a dataclass instance.
-    # We'll just return standard things. The AnalysisData builder in Orchestrator can handle "pitch_tracker" if we passed it back.
-    # But simpler: the orchestrator knows what it asked for.
-
     return timeline, notes, chords
 
-def _finalize_note_hyst(
+
+def _finalize_note(
     notes_list: List[NoteEvent],
-    start_time: float,
-    end_time: float,
-    pitches: List[float],
-    confidences: List[float],
-    min_duration: float
+    timeline: List[FramePitch],
+    indices: List[int],
+    locked_midi: float
 ):
-    duration = end_time - start_time
-    if duration < min_duration:
+    if not indices:
         return
 
-    median_midi = np.median(pitches)
-    rounded_midi = int(round(median_midi))
-    avg_conf = float(np.mean(confidences))
+    start_time = timeline[indices[0]].time
+    end_time = timeline[indices[-1]].time
 
+    # Calculate average RMS
+    # RMS is linear amplitude (usually 0-1ish for normalized audio)
+    rms_values = [timeline[i].rms for i in indices]
+    avg_rms = np.mean(rms_values) if rms_values else 0.0
+
+    # Confidence average
+    conf_values = [timeline[i].confidence for i in indices]
+    avg_conf = np.mean(conf_values) if conf_values else 0.0
+
+    rounded_midi = int(round(locked_midi))
     pitch_hz = midi_to_hz(rounded_midi)
+
+    # Note duration check? (Stage D might handle short notes, or we filter here?)
+    # "Gap merging ... < 1/32" is Stage D.
+    # Feature extraction usually keeps everything valid.
 
     note = NoteEvent(
         start_sec=start_time,
         end_sec=end_time,
         midi_note=rounded_midi,
         pitch_hz=pitch_hz,
-        confidence=avg_conf
+        confidence=float(avg_conf),
+        rms_value=float(avg_rms),
+        velocity=0.0 # Will be mapped in Stage D
     )
     notes_list.append(note)

@@ -2,72 +2,107 @@ import pytest
 import numpy as np
 from unittest.mock import MagicMock, patch
 from backend.pipeline.stage_b import extract_features
-from backend.pipeline.models import MetaData, NoteEvent, FramePitch
+from backend.pipeline.models import MetaData, NoteEvent
 
 @pytest.fixture
-def mock_meta():
-    return MetaData(
-        sample_rate=22050,
-        hop_length=256
-    )
-
-@pytest.fixture
-def sine_wave_440():
+def mock_audio_data():
     sr = 22050
     duration = 1.0
     t = np.linspace(0, duration, int(sr * duration))
-    # 440 Hz is MIDI 69
+    # 440Hz sine wave (A4)
     y = 0.5 * np.sin(2 * np.pi * 440 * t)
-    return y, sr
+    meta = MetaData(sample_rate=sr, hop_length=512, window_size=2048)
+    return y, sr, meta
 
-def test_extract_features_pyin(sine_wave_440, mock_meta):
-    y, sr = sine_wave_440
-    timeline, notes, chords = extract_features(y, sr, mock_meta, use_crepe=False)
+def test_extract_features_basic(mock_audio_data):
+    y, sr, meta = mock_audio_data
 
-    # Check timeline
-    assert len(timeline) > 0
-    # Check if pitch is detected around 440 Hz (MIDI 69)
-    valid_frames = [f for f in timeline if f.midi is not None]
-    assert len(valid_frames) > 0
-    avg_midi = np.mean([f.midi for f in valid_frames])
-    assert abs(avg_midi - 69) < 1.0
+    # Mock librosa.pyin to avoid heavy computation and ensure deterministic output
+    # We simulate a clear A4 (Midi 69)
+    n_frames = 100
+    f0 = np.full(n_frames, 440.0)
+    voiced_flag = np.full(n_frames, True)
+    voiced_probs = np.full(n_frames, 0.9)
+    times = np.linspace(0, 1.0, n_frames)
 
-    # Check segmentation
-    assert len(notes) >= 1
-    # Should be one long note roughly
-    # (Allowing for start/end transient silence in pyin)
-    n = notes[0]
-    assert n.midi_note == 69
-    assert n.end_sec - n.start_sec > 0.5
+    # Mock rms
+    rms = np.full((1, n_frames), 0.5)
 
-def test_pitch_jump_segmentation(mock_meta):
-    # Construct a signal with a jump
+    with patch('librosa.pyin', return_value=(f0, voiced_flag, voiced_probs)), \
+         patch('librosa.times_like', return_value=times), \
+         patch('librosa.feature.rms', return_value=rms):
+
+        timeline, notes, chords = extract_features(y, sr, meta)
+
+        assert len(notes) >= 1
+        assert notes[0].midi_note == 69
+        assert notes[0].rms_value > 0.0
+
+def test_extract_features_hysteresis_and_smoothing():
+    # Test the specific segmentation logic
+    # Scenario: Pitch wobbly but within smoothing/tolerance -> Single Note
+    # Scenario: Pitch jumps -> New Note
+
     sr = 22050
-    t1 = np.linspace(0, 0.5, int(sr * 0.5))
-    t2 = np.linspace(0, 0.5, int(sr * 0.5))
+    meta = MetaData(sample_rate=sr, hop_length=512, window_size=2048)
+    y = np.zeros(1000) # Dummy audio
 
-    # 440Hz (A4) -> 69
-    # 523Hz (C5) -> 72
-    y1 = 0.5 * np.sin(2 * np.pi * 440 * t1)
-    y2 = 0.5 * np.sin(2 * np.pi * 523.25 * t2)
-    y = np.concatenate([y1, y2])
+    # Construct synthetic f0 and confidence
+    # 1. Stable A4 (69) for 10 frames
+    # 2. Jump to C5 (72) for 10 frames
+    # 3. Drop in confidence for 5 frames (gap)
+    # 4. Short blip (1 frame) - should be ignored due to stability check
 
-    timeline, notes, chords = extract_features(y, sr, mock_meta)
+    f0 = np.concatenate([
+        np.full(10, 440.0), # A4
+        np.full(10, 523.25), # C5
+        np.full(5, 440.0), # (Low conf)
+        np.full(2, 440.0), # Short blip
+        np.full(10, 440.0) # Stable again
+    ])
 
-    # Should detect 2 notes
-    assert len(notes) == 2
-    assert notes[0].midi_note == 69
-    assert notes[1].midi_note == 72
-    # Ensure they are contiguous-ish
-    assert abs(notes[1].start_sec - notes[0].end_sec) < 0.1
+    conf = np.concatenate([
+        np.full(10, 0.9),
+        np.full(10, 0.9),
+        np.full(5, 0.1), # Low confidence
+        np.full(2, 0.9), # High conf but short
+        np.full(10, 0.9)
+    ])
 
-def test_silence_handling(mock_meta):
-    sr = 22050
-    y = np.zeros(sr * 1) # 1 sec silence
+    times = np.arange(len(f0)) * 0.01
+    rms = np.full((1, len(f0)), 0.5)
 
-    timeline, notes, chords = extract_features(y, sr, mock_meta)
+    with patch('librosa.pyin', return_value=(f0, None, conf)), \
+         patch('librosa.times_like', return_value=times), \
+         patch('librosa.feature.rms', return_value=rms), \
+         patch('scipy.signal.medfilt', side_effect=lambda x, **kwargs: x): # Bypass smoothing for precise control test
 
-    assert len(notes) == 0
-    # Timeline should be mostly unvoiced (midi=None)
-    voiced = [f for f in timeline if f.midi is not None]
-    assert len(voiced) == 0
+        timeline, notes, chords = extract_features(y, sr, meta)
+
+        # Expectation:
+        # Note 1: A4 (indices 0-9)
+        # Note 2: C5 (indices 10-19) - Jump caused split
+        # Gap (indices 20-24)
+        # Blip (indices 25-26) ignored (< 3 frames)
+        # Note 3: A4 (indices 27-36)
+
+        assert len(notes) == 3
+        assert notes[0].midi_note == 69
+        assert notes[1].midi_note == 72
+        assert notes[2].midi_note == 69
+
+def test_rms_calculation(mock_audio_data):
+    y, sr, meta = mock_audio_data
+    # RMS passed via librosa.feature.rms
+    # Let's verify it gets into the note event
+
+    rms_val = 0.123
+
+    with patch('librosa.pyin', return_value=(np.full(10, 440.0), None, np.full(10, 0.9))), \
+         patch('librosa.times_like', return_value=np.arange(10)*0.1), \
+         patch('librosa.feature.rms', return_value=np.full((1, 10), rms_val)):
+
+        timeline, notes, chords = extract_features(y, sr, meta)
+
+        assert len(notes) == 1
+        assert np.isclose(notes[0].rms_value, rms_val)

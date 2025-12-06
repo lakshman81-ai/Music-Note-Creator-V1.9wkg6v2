@@ -46,6 +46,7 @@ class FramePitch:
     pitch_hz: float                    # 0.0 if unvoiced
     midi: Optional[int]                # None if unvoiced
     confidence: float                  # 0–1
+    rms: float = 0.0                   # Frame RMS energy
 
 
 # ---------- Note events ----------
@@ -69,6 +70,7 @@ class NoteEvent:
 
     # Performance-ish info
     velocity: float = 0.8              # 0–1 (later mapped to MIDI 0–127)
+    rms_value: float = 0.0             # Raw RMS energy (linear)
     is_grace: bool = False
     dynamic: str = "mf"                # "p", "mf", "f", etc.
 
@@ -143,6 +145,7 @@ class AnalysisData:
                     "pitch_hz": e.pitch_hz,
                     "confidence": e.confidence,
                     "velocity": e.velocity,
+                    "rms_value": e.rms_value,
                     "is_grace": e.is_grace,
                     "dynamic": e.dynamic,
                     "measure": e.measure,
@@ -171,7 +174,7 @@ class AnalysisData:
 class TranscriptionResult:
     musicxml: str
     analysis_data: AnalysisData
-    midi_bytes: bytes = b"" # Added for benchmark support
+    midi_bytes: bytes = b""
 
     def __getitem__(self, key):
         """Allow dict-like access for compatibility."""
