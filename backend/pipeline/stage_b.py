@@ -1,6 +1,7 @@
 from typing import List, Tuple, Optional
 import numpy as np
 import librosa
+import scipy.signal
 from .models import MetaData, FramePitch, NoteEvent, ChordEvent
 
 def midi_to_hz(midi: float) -> float:
@@ -19,14 +20,26 @@ def extract_features(
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
     """
     Stage B: Pitch tracking and note segmentation.
+    Includes High-Pass Filtering for Melody Isolation in Polyphonic Mixes.
     """
-    hop_length = meta.hop_length # 512 typically
+    hop_length = meta.hop_length
 
-    # High-res RMS for silence detection
-    # Use a small window to catch short dips (e.g. 10ms ~ 220 samples)
+    # --- MELODY ISOLATION PRE-PROCESSING ---
+    # Apply a High-Pass Filter to suppress Bass/Chords
+    # Cutoff at ~200Hz (G3). This preserves female vocals, right-hand piano (C4+),
+    # but attenuates C3 chords and C2 bass heavily.
+    # Butterworth filter, 2nd order or higher.
+    sos = scipy.signal.butter(4, 200, 'hp', fs=sr, output='sos')
+    y_filtered = scipy.signal.sosfilt(sos, y)
+
+    # Use the FILTERED signal for pitch tracking
+    y_analysis = y_filtered
+
+    # --- SILENCE DETECTION (GATING) ---
+    # Use high-res RMS on the filtered signal to avoid bass rumble keeping the gate open
     rms_frame_length = 256
-    rms_hop_length = 64 # Overlap heavily
-    rms = librosa.feature.rms(y=y, frame_length=rms_frame_length, hop_length=rms_hop_length, center=True)[0]
+    rms_hop_length = 64
+    rms = librosa.feature.rms(y=y_analysis, frame_length=rms_frame_length, hop_length=rms_hop_length, center=True)[0]
 
     # Normalize RMS
     if np.max(rms) > 0:
@@ -36,7 +49,6 @@ def extract_features(
 
     rms_thresh = 0.05
 
-    # Helper to get min RMS in a time range (samples)
     def get_min_rms(start_sample, end_sample):
         start_idx = start_sample // rms_hop_length
         end_idx = end_sample // rms_hop_length
@@ -55,7 +67,7 @@ def extract_features(
         try:
             import crepe
             sr_crepe = 16000
-            y_crepe = librosa.resample(y, orig_sr=sr, target_sr=sr_crepe)
+            y_crepe = librosa.resample(y_analysis, orig_sr=sr, target_sr=sr_crepe)
             step_size_ms = (hop_length / sr) * 1000
             time_points, f0, confidence, _ = crepe.predict(y_crepe, sr_crepe, viterbi=True, step_size=step_size_ms, verbose=0)
             crepe_success = True
@@ -63,9 +75,18 @@ def extract_features(
             pass
 
     if not crepe_success:
-        fmin = librosa.note_to_hz("C2")
+        # Raise fmin to match our filter roughly, to help pyin not search low lags
+        fmin = librosa.note_to_hz("G3") # ~196Hz
         fmax = librosa.note_to_hz("C7")
-        f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=fmin, fmax=fmax, sr=sr, hop_length=hop_length, fill_na=0.0)
+
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            y_analysis,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            hop_length=hop_length,
+            fill_na=0.0
+        )
         time_points = librosa.times_like(f0, sr=sr, hop_length=hop_length)
         confidence = voiced_probs
 
@@ -73,18 +94,14 @@ def extract_features(
     timeline: List[FramePitch] = []
 
     for i, t in enumerate(time_points):
-        # Determine sample range for this frame
         start_samp = i * hop_length
         end_samp = (i + 1) * hop_length
-
-        # Check high-res RMS
         min_r = get_min_rms(start_samp, end_samp)
 
         f = f0[i] if i < len(f0) else 0.0
         c = confidence[i] if i < len(confidence) else 0.0
         p_hz = float(f)
 
-        # Gating
         if np.isnan(p_hz) or p_hz < 10.0 or min_r < rms_thresh:
             p_hz = 0.0
             midi_val = None
@@ -117,7 +134,6 @@ def extract_features(
                 last_midi_float = current_midi_values[-1]
                 avg_midi = np.mean(current_midi_values)
 
-                # Check for jump or drift
                 if abs(curr_midi_float - last_midi_float) > pitch_change_thresh or \
                    abs(curr_midi_float - avg_midi) > pitch_change_thresh:
                        _finalize_note(notes, current_start_time, frame.time, current_midi_values, current_confidences, min_duration)
