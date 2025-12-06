@@ -9,31 +9,30 @@ from .pipeline.stage_a import load_and_preprocess
 from .pipeline.stage_b import extract_features
 from .pipeline.stage_c import apply_theory
 from .pipeline.stage_d import quantize_and_render
-from .pipeline.models import AnalysisData, TranscriptionResult
+from .pipeline.models import AnalysisData, TranscriptionResult, MetaData
 
 def transcribe_audio_pipeline(
     audio_path: str,
     *,
     stereo_mode: Optional[str] = None, # ignored
-    use_mock: bool = False, # ignored
+    use_mock: bool = False,
     start_offset: Optional[float] = None, # ignored
     max_duration: Optional[float] = None, # ignored
     use_crepe: bool = False,
     **kwargs,
-) -> Any: # Returns TranscriptionResult (which acts like a dict)
+) -> TranscriptionResult:
     """
     High-level API used by both FastAPI and the benchmark script.
     Orchestrates Stages A -> B -> C -> D.
     """
     if use_mock:
         # Legacy mock behavior for testing
-        from .pipeline.models import AnalysisData, MetaData
         mock_xml_path = os.path.join(os.path.dirname(__file__), "mock_data", "happy_birthday.xml")
         if os.path.exists(mock_xml_path):
             with open(mock_xml_path, 'r', encoding='utf-8') as f:
                 musicxml_str = f.read()
         else:
-            musicxml_str = "<?xml ...>"
+            musicxml_str = "<?xml version='1.0' encoding='utf-8'?><score-partwise><part><measure><note><rest/></note></measure></part></score-partwise>"
 
         return TranscriptionResult(
             musicxml=musicxml_str,
@@ -62,11 +61,6 @@ def transcribe_audio_pipeline(
     )
 
     # Store pre-quantization notes
-    # We need to deep copy if we want to preserve them exactly,
-    # but NoteEvent is mutable. Stage D modifies them in place (adding beat info).
-    # So let's copy them if we want to keep "raw" timing.
-    # For now, just assigning. Stage D adds fields, doesn't change start_sec/end_sec usually,
-    # but does sort them.
     from dataclasses import replace
     analysis_data.notes_before_quantization = [replace(n) for n in notes]
 
@@ -78,6 +72,9 @@ def transcribe_audio_pipeline(
 
     # 6. Generate MIDI bytes
     midi_bytes = b""
+    tmp_xml_path = None
+    tmp_midi_path = None
+
     try:
         # Save XML to temp file to parse back for MIDI generation
         # (music21 allows parsing string, but temp file is safer for some backends)
@@ -96,17 +93,17 @@ def transcribe_audio_pipeline(
             with open(tmp_midi_path, 'rb') as f:
                 midi_bytes = f.read()
 
-            os.remove(tmp_midi_path)
-
         except Exception as e:
             print(f"MIDI generation failed: {e}")
             midi_bytes = b""
-        finally:
-            if os.path.exists(tmp_xml_path):
-                os.remove(tmp_xml_path)
 
     except Exception as e:
         print(f"Failed to generate MIDI wrapper: {e}")
+    finally:
+        if tmp_xml_path and os.path.exists(tmp_xml_path):
+            os.remove(tmp_xml_path)
+        if tmp_midi_path and os.path.exists(tmp_midi_path):
+            os.remove(tmp_midi_path)
 
     result = TranscriptionResult(
         musicxml=musicxml_str,

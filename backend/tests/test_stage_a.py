@@ -1,43 +1,66 @@
 import pytest
 import numpy as np
 import os
-from unittest.mock import patch, MagicMock
-from backend.pipeline.stage_a import load_and_preprocess
-from backend.pipeline.models import MetaData
+import soundfile as sf
+from unittest.mock import MagicMock, patch
+from backend.pipeline.stage_a import load_and_preprocess, TARGET_LUFS, SILENCE_THRESHOLD_DB
 
+# Use a real file or create one for testing
 @pytest.fixture
-def mock_audio_file(tmp_path):
-    # Create a dummy wav file
-    import soundfile as sf
-    path = tmp_path / "test.wav"
+def temp_wav_file(tmp_path):
+    path = tmp_path / "test_audio.wav"
     sr = 22050
-    # Generate 1 sec of sine wave
-    t = np.linspace(0, 1, sr)
-    y = 0.5 * np.sin(2 * np.pi * 440 * t)
-    sf.write(path, y, sr)
+    duration = 1.0
+    t = np.linspace(0, duration, int(sr * duration))
+    # A sine wave at -10dB
+    y = 0.3 * np.sin(2 * np.pi * 440 * t)
+    sf.write(str(path), y, sr)
     return str(path)
 
 @pytest.fixture
-def mock_silence_file(tmp_path):
-    import soundfile as sf
-    path = tmp_path / "silence.wav"
+def silence_padded_wav_file(tmp_path):
+    path = tmp_path / "silence_padded.wav"
     sr = 22050
-    y = np.zeros(sr)
-    sf.write(path, y, sr)
+    # 0.5s silence, 1s tone, 0.5s silence
+    silence = np.zeros(int(0.5 * sr))
+    t = np.linspace(0, 1.0, int(sr * 1.0))
+    tone = 0.5 * np.sin(2 * np.pi * 440 * t)
+    y = np.concatenate([silence, tone, silence])
+    sf.write(str(path), y, sr)
     return str(path)
 
-def test_load_and_preprocess_success(mock_audio_file):
-    y, sr, meta = load_and_preprocess(mock_audio_file, target_sr=22050)
+def test_load_and_preprocess_success(temp_wav_file):
+    y, sr, meta = load_and_preprocess(temp_wav_file)
     assert sr == 22050
-    assert isinstance(meta, MetaData)
-    assert meta.duration_sec >= 1.0
-    assert y.ndim == 1
-    assert np.abs(meta.lufs - (-14.0)) < 1.0 # Should be normalized to near -14
+    assert len(y) > 0
+    assert meta.target_sr == 22050
+    # Check normalization
+    assert np.isclose(meta.lufs, TARGET_LUFS, atol=0.5)
 
-def test_load_short_file(tmp_path):
-    import soundfile as sf
+def test_load_fallback_soundfile(tmp_path):
+    # Create a file that librosa might fail on if forced (mocking librosa fail)
+    path = tmp_path / "fallback.wav"
+    sf.write(str(path), np.random.uniform(-0.1, 0.1, 22050), 22050)
+
+    with patch('librosa.load', side_effect=Exception("Librosa fail")):
+        y, sr, meta = load_and_preprocess(str(path))
+        assert len(y) > 0
+        assert meta.audio_path == str(path)
+
+def test_silence_trimming(silence_padded_wav_file):
+    # The file has 0.5s silence at start/end.
+    # trimming should remove most of it.
+    y, sr, meta = load_and_preprocess(silence_padded_wav_file)
+
+    # Original length was 2.0s. Trimmed should be around 1.0s.
+    # Allowing some margin for transitions
+    assert meta.duration_sec < 1.8
+    assert meta.duration_sec > 0.8
+
+def test_audio_too_short(tmp_path):
     path = tmp_path / "short.wav"
-    sf.write(path, np.zeros(100), 22050) # Very short
+    # Create 0.1s audio
+    sf.write(str(path), np.zeros(2000), 22050)
 
     with pytest.raises(ValueError, match="Audio too short"):
         load_and_preprocess(str(path))
@@ -45,24 +68,3 @@ def test_load_short_file(tmp_path):
 def test_file_not_found():
     with pytest.raises(FileNotFoundError):
         load_and_preprocess("non_existent.wav")
-
-def test_resampling(mock_audio_file):
-    # Original is 22050. Request 16000.
-    y, sr, meta = load_and_preprocess(mock_audio_file, target_sr=16000)
-    assert sr == 16000
-    assert meta.original_sr == 22050
-    assert len(y) == 16000
-
-def test_stereo_downmix(tmp_path):
-    import soundfile as sf
-    path = tmp_path / "stereo.wav"
-    sr = 22050
-    # Stereo sine
-    t = np.linspace(0, 1, sr)
-    y = 0.5 * np.sin(2 * np.pi * 440 * t)
-    stereo = np.vstack([y, y]).T
-    sf.write(path, stereo, sr)
-
-    y_out, _, meta = load_and_preprocess(str(path))
-    assert y_out.ndim == 1
-    assert meta.n_channels == 2

@@ -4,9 +4,9 @@ import sys
 import glob
 import numpy as np
 import music21
+import tempfile
 from typing import List, Tuple, Dict
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # Add backend to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -26,7 +26,6 @@ class BenchmarkMetrics:
 def parse_xml_notes(xml_path: str) -> List[NoteEvent]:
     """
     Parse a MusicXML file into a list of NoteEvents.
-    Simplified parsing: extracts onset, offset, midi pitch.
     """
     try:
         score = music21.converter.parse(xml_path)
@@ -38,9 +37,9 @@ def parse_xml_notes(xml_path: str) -> List[NoteEvent]:
 
         for n in flat_score:
             if isinstance(n, music21.note.Note):
-                # Start time in seconds?
-                # We need tempo map to convert beats to seconds.
-                # If XML has tempo, music21 handles secondsMap.
+                # Start time in seconds using .seconds property (requires metronome)
+                # If XML doesn't have metronome, this might be tricky.
+                # Assuming 120bpm default if missing.
                 start_sec = n.seconds
                 duration_sec = n.duration.seconds
                 end_sec = start_sec + duration_sec
@@ -53,18 +52,17 @@ def parse_xml_notes(xml_path: str) -> List[NoteEvent]:
                     pitch_hz=n.pitch.frequency
                 ))
             elif isinstance(n, music21.chord.Chord):
-                # Handle chords if needed, for now pick top note or root
-                # Requirement implies monophonic mostly, but let's take root
-                for p in n.pitches:
-                    start_sec = n.seconds
-                    duration_sec = n.duration.seconds
-                    end_sec = start_sec + duration_sec
-                    notes.append(NoteEvent(
-                        start_sec=start_sec,
-                        end_sec=end_sec,
-                        midi_note=int(p.midi),
-                        pitch_hz=p.frequency
-                    ))
+                # Take root
+                p = n.root()
+                start_sec = n.seconds
+                duration_sec = n.duration.seconds
+                end_sec = start_sec + duration_sec
+                notes.append(NoteEvent(
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    midi_note=int(p.midi),
+                    pitch_hz=p.frequency
+                ))
 
         # Sort by start time
         notes.sort(key=lambda x: x.start_sec)
@@ -77,26 +75,19 @@ def match_notes(ref_notes: List[NoteEvent], hyp_notes: List[NoteEvent],
                 onset_tol: float = 0.1, pitch_tol: float = 0.5) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
     """
     Greedy matching of hypothesis notes to reference notes.
-    Returns (matches, missed_ref_indices, extra_hyp_indices)
     """
     matches = [] # List of (ref_idx, hyp_idx)
     matched_ref = set()
     matched_hyp = set()
 
-    # Simple greedy: for each ref, find closest hyp in time that matches pitch
     for r_idx, r_note in enumerate(ref_notes):
         best_h_idx = -1
         min_onset_diff = float('inf')
 
-        # Look for candidates
         for h_idx, h_note in enumerate(hyp_notes):
             if h_idx in matched_hyp:
                 continue
 
-            # Pitch check (exact integer match usually required, or tolerance)
-            # User specified: "matched note pairs, semitone tolerance +-0.5"
-            # Since we deal with integers mostly for MIDI, strict equality is safest,
-            # but tolerance allows microtonal/rounding differences.
             if abs(r_note.midi_note - h_note.midi_note) <= pitch_tol:
                 onset_diff = abs(r_note.start_sec - h_note.start_sec)
                 if onset_diff <= onset_tol:
@@ -149,20 +140,8 @@ def calculate_metrics(ref_notes: List[NoteEvent], hyp_notes: List[NoteEvent]) ->
 def run_benchmark_single(args: Tuple[str, str, bool]) -> BenchmarkMetrics:
     audio_path, ref_xml_path, use_crepe = args
 
-    # Transcribe
     try:
-        # We need to capture the output XML or notes directly.
-        # The pipeline returns AnalysisData with notes before quantization,
-        # but the reference XML is likely quantized or "perfect".
-        # We should probably compare the FINAL quantized output if the reference is standard notation.
-        # But if we want to measure transcription accuracy (Stage B), we might check pre-quantization.
-        # User requirement: "Benchmark ... against reference MusicXML files."
-        # Usually implies final output vs reference.
-
         result = transcribe_audio_pipeline(audio_path, use_crepe=use_crepe)
-
-        # Parse result XML (or use result.analysis_data.notes if we trust it matches XML)
-        # To be safe and test Stage D, let's parse the generated XML string.
 
         with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False, mode='w', encoding='utf-8') as tmp:
             tmp.write(result.musicxml)
@@ -181,7 +160,7 @@ def run_benchmark_single(args: Tuple[str, str, bool]) -> BenchmarkMetrics:
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Transcription Pipeline")
-    parser.add_argument("--data_dir", type=str, help="Directory containing pairs of .wav and .musicxml (same name)")
+    parser.add_argument("--data_dir", type=str, help="Directory containing pairs of .wav and .musicxml")
     parser.add_argument("--audio", type=str, help="Single audio file")
     parser.add_argument("--ref", type=str, help="Reference XML file")
     parser.add_argument("--use_crepe", action="store_true", help="Use CREPE pitch tracker")
@@ -191,7 +170,6 @@ def main():
     pairs = []
 
     if args.data_dir:
-        # Find all wavs
         wavs = glob.glob(os.path.join(args.data_dir, "*.wav"))
         for w in wavs:
             base = os.path.splitext(w)[0]
@@ -213,7 +191,6 @@ def main():
 
     metrics_list = []
 
-    # Run sequentially for now to avoid librosa/multiprocessing issues if any
     for audio, ref in pairs:
         print(f"Processing {os.path.basename(audio)}...")
         m = run_benchmark_single((audio, ref, args.use_crepe))
@@ -224,7 +201,6 @@ def main():
         print("No results.")
         return
 
-    # Aggregate
     avg_f1 = np.mean([m.f1 for m in metrics_list])
     avg_prec = np.mean([m.precision for m in metrics_list])
     avg_rec = np.mean([m.recall for m in metrics_list])
