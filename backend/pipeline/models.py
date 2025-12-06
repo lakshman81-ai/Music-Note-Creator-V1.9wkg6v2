@@ -21,9 +21,14 @@ class MetaData:
     snr: float = 0.0                   # signal-to-noise estimate
     window_size: int = 2048            # analysis window size
     hop_length: int = 512              # analysis hop length
-    sample_rate: int = 22050           # analysis sample rate
-    tempo_bpm: float = 120.0           # global tempo estimate
+    sample_rate: int = 22050           # analysis sample rate (corresponds to target_sr)
+    tempo_bpm: Optional[float] = 120.0 # global tempo estimate
     time_signature: str = "4/4"        # default, can be improved later
+
+    # New fields
+    original_sr: Optional[int] = None
+    target_sr: int = 22050
+    duration_sec: float = 0.0
 
 
 # ---------- Pitch timeline ----------
@@ -96,10 +101,16 @@ class AnalysisData:
     chords: List[ChordEvent] = field(default_factory=list)
     vexflow_layout: VexflowLayout = field(default_factory=VexflowLayout)
 
+    # New fields
+    notes: List[NoteEvent] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         """
         JSON-serializable representation for debugging / API.
         """
+        # Ensure 'notes' field is populated if empty but 'events' is not
+        notes_to_use = self.notes if self.notes else self.events
+
         return {
             "meta": asdict(self.meta),
             "timeline": [asdict(f) for f in self.timeline],
@@ -119,7 +130,7 @@ class AnalysisData:
                     "alternatives": [asdict(a) for a in e.alternatives],
                     "spec_thumb": e.spec_thumb,
                 }
-                for e in self.events
+                for e in notes_to_use
             ],
             "chords": [
                 {
@@ -139,3 +150,20 @@ class AnalysisData:
 class TranscriptionResult:
     musicxml: str
     analysis_data: AnalysisData
+    midi_bytes: bytes = b"" # Added for benchmark support
+
+    def __getitem__(self, key):
+        """Allow dict-like access for compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        if key == "meta":
+            return self.analysis_data.meta
+        if key == "notes":
+            return self.analysis_data.notes
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default

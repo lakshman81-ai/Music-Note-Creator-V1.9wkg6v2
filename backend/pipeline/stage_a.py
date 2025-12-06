@@ -1,111 +1,87 @@
-from __future__ import annotations
-
 from typing import Tuple
-
 import numpy as np
+import librosa
 import soundfile as sf
 import pyloudnorm as pyln
-import librosa
-
 from .models import MetaData
 
-
-TARGET_SR = 22050
-TARGET_LUFS = -14.0
-
-
-def _load_audio(file_path: str, stereo_mode: bool) -> Tuple[np.ndarray, int]:
-    """
-    Load audio using soundfile. If stereo_mode=False, mix to mono.
-    """
-    y, sr = sf.read(file_path, always_2d=True)
-    if not stereo_mode:
-        # simple average of channels -> mono
-        y = y.mean(axis=1)
-    else:
-        # for now, use mid channel (you can upgrade to true stereo later)
-        y = y.mean(axis=1)
-    return y.astype(np.float32), sr
-
-
-def _remove_dc(y: np.ndarray) -> np.ndarray:
-    return y - np.mean(y)
-
-
-def _normalize_lufs(y: np.ndarray, sr: int, target_lufs: float) -> tuple[np.ndarray, float]:
-    meter = pyln.Meter(sr)
-    loudness = meter.integrated_loudness(y)
-    y_norm = pyln.normalize.loudness(y, loudness, target_lufs)
-    return y_norm.astype(np.float32), float(loudness)
-
-
 def load_and_preprocess(
-    file_path: str,
-    stereo_mode: bool = False,
-    start_offset: float = 0.0,
-    max_duration: float | None = None,
-) -> tuple[np.ndarray, int, MetaData]:
+    audio_path: str,
+    target_sr: int = 22050,
+) -> Tuple[np.ndarray, int, MetaData]:
     """
-    Stage A: Advanced Pre-processing
-
-    1. Load audio (soundfile)
-    2. Stereo handling
-    3. DC offset removal
-    4. Loudness normalization (LUFS)
-    5. Resample to TARGET_SR
-    6. Apply start_offset and max_duration (segmenting)
-    7. Estimate tuning and correct to A=440
+    Stage A: Load, downmix, resample, and normalize audio.
     """
-    meta = MetaData()
+    # 1. Load audio
+    # librosa.load supports resampling and mono conversion, but let's do it explicitly
+    # to handle metadata extraction better and follow requirements.
 
-    # A1–2: load and stereo handling
-    y, sr = _load_audio(file_path, stereo_mode=stereo_mode)
+    # Use soundfile/librosa to get original info first if possible, but librosa.load is robust.
+    # We use librosa.load with sr=None to get original sampling rate.
+    try:
+        y_orig, sr_orig = librosa.load(audio_path, sr=None, mono=False)
+    except Exception as e:
+        # Fallback for formats librosa might struggle with, though it uses soundfile/audioread internally
+        raise RuntimeError(f"Failed to load audio file {audio_path}: {e}")
 
-    # Handle start_offset (in seconds)
-    if start_offset and start_offset > 0.0:
-        start_samples = int(start_offset * sr)
-        if start_samples < len(y):
-            y = y[start_samples:]
+    duration_sec = float(librosa.get_duration(y=y_orig, sr=sr_orig))
+
+    # 2. Downmix to mono if needed
+    if y_orig.ndim > 1:
+        # Average channels
+        y_mono = np.mean(y_orig, axis=0)
+    else:
+        y_mono = y_orig
+
+    # 3. Resample to target_sr
+    if sr_orig != target_sr:
+        y_resampled = librosa.resample(y_mono, orig_sr=sr_orig, target_sr=target_sr)
+    else:
+        y_resampled = y_mono
+
+    # 4. Normalize loudness
+    # Try LUFS normalization
+    try:
+        meter = pyln.Meter(target_sr)  # create BS.1770 meter
+        loudness = meter.integrated_loudness(y_resampled)
+
+        if np.isneginf(loudness):
+             # Silence or near silence
+             y_normalized = y_resampled
+             final_lufs = -70.0 # arbitrary low value
         else:
-            # If offset beyond audio length, return tiny silence
-            y = np.zeros(int(sr * 0.5), dtype=np.float32)
+            target_lufs = -20.0
+            y_normalized = pyln.normalize.loudness(y_resampled, loudness, target_lufs)
+            final_lufs = target_lufs
 
-    # Optional duration limit
-    if max_duration is not None and max_duration > 0:
-        max_samples = int(max_duration * sr)
-        if y.shape[0] > max_samples:
-            y = y[:max_samples]
+            # Check for clipping after LUFS normalization and peak normalize if needed
+            peak = np.max(np.abs(y_normalized))
+            if peak > 1.0:
+                y_normalized = y_normalized / peak
 
-    # A3: DC removal
-    y = _remove_dc(y)
-
-    # A4: Loudness normalization
-    try:
-        y, measured_lufs = _normalize_lufs(y, sr, TARGET_LUFS)
-        meta.lufs = measured_lufs
     except Exception:
-        # Fallback: simple peak norm
-        peak = float(np.max(np.abs(y)) + 1e-9)
-        y = (y / peak).astype(np.float32)
-        meta.lufs = TARGET_LUFS
+        # Fallback to peak normalization
+        peak = np.max(np.abs(y_resampled))
+        if peak > 0:
+            y_normalized = y_resampled / peak
+        else:
+            y_normalized = y_resampled
+        final_lufs = -14.0 # generic placeholder
 
-    # A5: Resample
-    if sr != TARGET_SR:
-        y = librosa.resample(y, orig_sr=sr, target_sr=TARGET_SR, res_type="kaiser_best")
-        sr = TARGET_SR
+    # Ensure float32
+    y_final = y_normalized.astype(np.float32)
 
-    meta.sample_rate = sr
+    # 5. Fill MetaData
+    meta = MetaData(
+        original_sr=sr_orig,
+        target_sr=target_sr,
+        sample_rate=target_sr, # for compat
+        duration_sec=duration_sec,
+        hop_length=256, # Default as per requirements
+        time_signature="4/4",
+        tempo_bpm=None,
+        lufs=final_lufs,
+        processing_mode="mono"
+    )
 
-    # A6: tuning estimate & correction
-    try:
-        tuning_offset = float(librosa.estimate_tuning(y=y, sr=sr))
-    except Exception:
-        tuning_offset = 0.0
-
-    meta.tuning_offset = tuning_offset
-
-    if abs(tuning_offset) > 0.01:
-        # librosa.estimate_tuning gives semitone fraction
-        y = librosa.effects.pitch_shift(y, sr=sr, n_steps=-tuning_offset)
-
-    return y, sr, meta
+    return y_final, target_sr, meta
