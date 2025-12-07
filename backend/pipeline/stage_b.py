@@ -32,7 +32,7 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
     """
     Stage B: Analysis & Feature Extraction
 
-    1. Fallback Chain (Basic-Pitch -> CREPE -> HPSS)
+    1. Fallback Chain (CREPE -> Basic-Pitch -> HPSS)
     2. Attack / Transient Modeling (Spectral Flux)
     3. Octave Error Correction
     4. Vibrato & Modulation Handling
@@ -50,50 +50,13 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
     hop_length = n_fft // 4
 
     # B1. Fallback Chain
-    # Priority: Basic-Pitch (Polyphonic)
+    # Priority: CREPE (Monophonic High Accuracy) -> Basic-Pitch (Polyphonic) -> HPSS
 
     has_polyphonic_result = False
 
-    if BASIC_PITCH_AVAILABLE:
-        import tempfile
-        import soundfile as sf
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, y, sr)
-            tmp_path = tmp.name
-
-        try:
-            _, midi_data, _ = predict(tmp_path)
-
-            for instrument in midi_data.instruments:
-                for note in instrument.notes:
-                    # Capture velocity as amplitude (0.0 - 1.0)
-                    amp = note.velocity / 127.0 if hasattr(note, 'velocity') else 0.5
-                    events.append(NoteEvent(
-                        id=f"bp_{len(events)}",
-                        midi_note=note.pitch,
-                        start_sec=note.start,
-                        end_sec=note.end,
-                        start_beat=0.0,
-                        duration_beat=0.0,
-                        confidence=0.9,
-                        type="normal",
-                        voice=1,
-                        amplitude=amp
-                    ))
-
-            has_polyphonic_result = len(events) > 0
-            meta.processing_mode = "basic_pitch"
-
-        except Exception as e:
-            print(f"Basic Pitch failed: {e}")
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    # Fallback: CREPE (Monophonic)
-    if not has_polyphonic_result and CREPE_AVAILABLE:
-        print("Falling back to CREPE...")
+    # 1. Try CREPE (Monophonic) First (Default per new requirement)
+    if CREPE_AVAILABLE:
+        print("Running CREPE...")
         try:
             # B4. Vibrato & Modulation Handling (Pre-processing for Crepe?)
             # Actually Crepe handles vibrato well, but we need to smooth the output pitch curve.
@@ -168,7 +131,48 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
         except Exception as e:
             print(f"CREPE failed: {e}")
 
-    # Fallback: HPSS + Librosa
+    # 2. Try Basic-Pitch (Polyphonic) if CREPE failed or yielded nothing (or user prefers polyphonic, but here we prioritize CREPE)
+    # We only run Basic Pitch if we don't have results yet (i.e. CREPE failed or unavailable)
+    if not has_polyphonic_result and BASIC_PITCH_AVAILABLE:
+        print("Falling back to Basic Pitch...")
+        import tempfile
+        import soundfile as sf
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, y, sr)
+            tmp_path = tmp.name
+
+        try:
+            _, midi_data, _ = predict(tmp_path)
+
+            for instrument in midi_data.instruments:
+                for note in instrument.notes:
+                    # Capture velocity as amplitude (0.0 - 1.0)
+                    amp = note.velocity / 127.0 if hasattr(note, 'velocity') else 0.5
+                    events.append(NoteEvent(
+                        id=f"bp_{len(events)}",
+                        midi_note=note.pitch,
+                        start_sec=note.start,
+                        end_sec=note.end,
+                        start_beat=0.0,
+                        duration_beat=0.0,
+                        confidence=0.9,
+                        type="normal",
+                        voice=1,
+                        amplitude=amp
+                    ))
+
+            if len(events) > 0:
+                has_polyphonic_result = True
+                meta.processing_mode = "basic_pitch"
+
+        except Exception as e:
+            print(f"Basic Pitch failed: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    # 3. Fallback: HPSS + Librosa
     if not has_polyphonic_result:
         print("Falling back to Librosa (HPSS)...")
         y_harmonic, _ = librosa.effects.hpss(y)
@@ -228,12 +232,18 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
         idx = np.argmin(np.abs(onset_times - e.start_sec))
         attack_energy = onset_env[idx]
 
-        # If attack energy is low, mark as slur?
-        # This usually requires context (is it connected to previous note?)
-        # For now, we store it or use it for "type"
-        if attack_energy < 1.0: # Threshold dependent on normalization
-             # Might be slur or grace
-             pass
+        # Threshold for slur vs re-articulation
+        # This is a heuristic.
+        if attack_energy < 1.0:
+             # Mark as possible slur. If it's a Grace note candidate (short), it stays grace.
+             if e.type != "grace":
+                 # We don't have a "slur" type in NoteEvent enum, but we can store it or use 'type'
+                 # The user specs say "Low attack energy + pitch continuity -> slur"
+                 # We'll mark it in a way we can use in Stage C or D.
+                 # Let's assume we use 'type'="slur_start" or similar, or just trust the standard notation.
+                 # For now, we'll just set a flag if we had one.
+                 # Let's set type="legato" if not normal.
+                 e.type = "legato"
 
     # B3. Octave Error Correction
     # "Compare energy at f, 2f, 4f. Correct doubling or halving errors."
