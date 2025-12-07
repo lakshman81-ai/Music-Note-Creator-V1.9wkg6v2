@@ -31,9 +31,9 @@ def silence_padded_wav_file(tmp_path):
 
 def test_load_and_preprocess_success(temp_wav_file):
     y, sr, meta = load_and_preprocess(temp_wav_file)
-    assert sr == 22050
+    assert sr == 44100
     assert len(y) > 0
-    assert meta.target_sr == 22050
+    assert meta.target_sr == 44100
     # Check normalization
     assert np.isclose(meta.lufs, TARGET_LUFS, atol=0.5)
 

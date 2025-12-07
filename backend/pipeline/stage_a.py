@@ -9,13 +9,13 @@ from .models import MetaData
 
 # Constants
 TARGET_LUFS = -23.0  # EBU R128 standard
-MIN_DURATION_SEC = 0.5
+MIN_DURATION_SEC = 0.120 # 120 ms
 MAX_DURATION_SEC = 600.0
 SILENCE_THRESHOLD_DB = 40  # top_db for trim
 
 def load_and_preprocess(
     audio_path: str,
-    target_sr: int = 22050,
+    target_sr: int = 44100,
 ) -> Tuple[np.ndarray, int, MetaData]:
     """
     Stage A: Robust audio loading, silence trimming, mono conversion, resampling, and EBU R128 normalization.
@@ -131,7 +131,8 @@ def load_and_preprocess(
         target_sr=target_sr,
         sample_rate=target_sr,
         duration_sec=duration_sec,
-        hop_length=256,
+        window_size=1024,
+        hop_length=512,
         time_signature="4/4",
         tempo_bpm=None,
         lufs=final_lufs,
