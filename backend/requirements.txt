@@ -12,3 +12,5 @@ crepe
 mir_eval
 pretty_midi
 pandas
+torch
+mir_eval
