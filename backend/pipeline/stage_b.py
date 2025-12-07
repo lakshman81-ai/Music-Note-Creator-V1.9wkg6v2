@@ -67,6 +67,8 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
 
             for instrument in midi_data.instruments:
                 for note in instrument.notes:
+                    # Capture velocity as amplitude (0.0 - 1.0)
+                    amp = note.velocity / 127.0 if hasattr(note, 'velocity') else 0.5
                     events.append(NoteEvent(
                         id=f"bp_{len(events)}",
                         midi_note=note.pitch,
@@ -76,7 +78,8 @@ def extract_features(y: np.ndarray, sr: int, meta: MetaData) -> Tuple[List[NoteE
                         duration_beat=0.0,
                         confidence=0.9,
                         type="normal",
-                        voice=1
+                        voice=1,
+                        amplitude=amp
                     ))
 
             has_polyphonic_result = len(events) > 0

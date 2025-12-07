@@ -62,15 +62,15 @@ def apply_theory(events: List[NoteEvent], analysis_data: AnalysisData):
 
     # C3. Dynamics
     # Map amplitude -> dynamics
-    # We don't have per-note amplitude in NoteEvent yet (mocked as 0.0).
-    # If we had it (from Basic Pitch or CREPE), we would map it.
-    # Let's assume amplitude is populated or we infer it.
+    # Amplitude is 0.0 to 1.0 (derived from velocity in Stage B)
     for event in events:
-        # Placeholder logic
-        if event.confidence > 0.9:
+        amp = event.amplitude
+        if amp > 0.75:
             event.dynamic = "f"
-        elif event.confidence > 0.7:
+        elif amp > 0.5:
             event.dynamic = "mf"
+        elif amp > 0.25:
+            event.dynamic = "mp"
         else:
             event.dynamic = "p"
 
