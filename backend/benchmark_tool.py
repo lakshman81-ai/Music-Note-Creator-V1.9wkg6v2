@@ -44,24 +44,33 @@ def parse_xml_notes(xml_path: str) -> Tuple[np.ndarray, np.ndarray]:
 
         # Unroll repeats and ties (simplified: flattening)
         # music21's flat properly handles offsets
-        flat_score = score.flat.notes
+        flat_score = score.flatten()
+        notes = flat_score.notes
 
-        for n in flat_score:
+        # Determine tempo
+        tempos = flat_score.getElementsByClass(music21.tempo.MetronomeMark)
+        current_bpm = 120.0
+        if len(tempos) > 0:
+            current_bpm = tempos[0].getQuarterBPM()
+
+        seconds_per_quarter = 60.0 / current_bpm
+
+        for n in notes:
+            # Calculate time from offsets (quarter notes)
+            start_sec = n.offset * seconds_per_quarter
+            duration_sec = n.duration.quarterLength * seconds_per_quarter
+            end_sec = start_sec + duration_sec
+
             if isinstance(n, music21.note.Note):
-                start_sec = n.seconds
-                duration_sec = n.duration.seconds
-                end_sec = start_sec + duration_sec
-
                 intervals.append([start_sec, end_sec])
                 freqs.append(n.pitch.frequency)
 
             elif isinstance(n, music21.chord.Chord):
-                # Take root
+                # For chords, standard monophonic evaluation usually takes the top line or root.
+                # mir_eval expects single F0 for melody.
+                # Let's take the root for consistency with previous logic,
+                # but be aware this is lossy for polyphonic matching.
                 p = n.root()
-                start_sec = n.seconds
-                duration_sec = n.duration.seconds
-                end_sec = start_sec + duration_sec
-
                 intervals.append([start_sec, end_sec])
                 freqs.append(p.frequency)
 
@@ -85,7 +94,8 @@ def run_benchmark_single(args: Tuple[str, str, bool]) -> BenchmarkMetrics:
 
     try:
         # 1. Transcribe
-        result = transcribe_audio_pipeline(audio_path, use_crepe=use_crepe)
+        # Disable trimming for benchmark alignment
+        result = transcribe_audio_pipeline(audio_path, use_crepe=use_crepe, trim_silence=False)
 
         # Save temp hypothesis XML
         with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False, mode='w', encoding='utf-8') as tmp:
@@ -135,6 +145,10 @@ def run_benchmark_single(args: Tuple[str, str, bool]) -> BenchmarkMetrics:
 
         ref_frames = mir_eval.util.interpolate_intervals(ref_intervals, ref_pitches, time_grid, fill_value=0.0)
         est_frames = mir_eval.util.interpolate_intervals(est_intervals, est_pitches, time_grid, fill_value=0.0)
+
+        # Ensure they are numpy arrays
+        ref_frames = np.array(ref_frames)
+        est_frames = np.array(est_frames)
 
         # Filter for voicing
         # RPA: Proportion of voiced frames with correct pitch (+- 50c)

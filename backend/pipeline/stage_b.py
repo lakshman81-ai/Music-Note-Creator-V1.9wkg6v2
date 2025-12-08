@@ -43,7 +43,8 @@ def extract_features(
     max_len = 0
 
     # Get RMS for length reference and later usage
-    rms_frames = librosa.feature.rms(y=y, frame_length=meta.window_size, hop_length=hop_length)[0]
+    # Use smaller frame_length for RMS to catch short dips (re-attacks)
+    rms_frames = librosa.feature.rms(y=y, frame_length=hop_length, hop_length=hop_length)[0]
     max_len = len(rms_frames)
 
     for name, det in detectors:
