@@ -69,6 +69,7 @@ def apply_theory(
     # We iterate frames
     active_start_idx = None
     active_ref_midi = None
+    active_peak_rms = 0.0
     active_indices = []
 
     # Buffer for start detection
@@ -117,6 +118,8 @@ def apply_theory(
                     active_start_idx = buf_indices[0]
                     active_ref_midi = ref_m
                     active_indices = list(buf_indices)
+                    # Init peak RMS
+                    active_peak_rms = max([timeline[x].rms for x in buf_indices])
                     potential_start_buffer = []
                 else:
                     # Slide buffer
@@ -144,27 +147,18 @@ def apply_theory(
                 if c1 < conf_thresh_start and c2 < conf_thresh_start and c3 < conf_thresh_start:
                     should_end = True
 
-            # 3. Silence >= 120 ms
-            # If pitch is 0 (unvoiced) -> silence.
-            # If we have a gap of silence > 120ms.
-            # "silence" can be defined as low confidence or zero pitch.
-            # If we see silence, we might track how long.
-            # Simplification: If current frame is silence (hz=0), does it contribute to 120ms gap?
-            # If we have N frames of silence -> end.
-            # 120ms / frame_step (approx 11.6ms) ~ 10 frames.
+            # 3. Silence / Re-attack detection
+            # If RMS drops significantly (e.g. near zero), split the note.
+            # This handles repeated notes with envelopes (release -> attack).
             if not should_end:
-                # Check consecutive silence?
-                # Easier: if current frame is silence/low conf, check if last X frames were also.
-                # Actually, condition 2 covers "conf < 0.10".
-                # "Silence" usually means no signal (RMS) or no pitch.
-                # Condition 2 is "Conf < 0.10 for 3 frames".
-                # 3 frames is ~35ms. This is much shorter than 120ms.
-                # So Condition 2 is stricter than Condition 3?
-                # "Note ends when... conf < 0.10 for >=3 frames OR silence >= 120ms".
-                # If "conf < 0.10" implies silence, then 3 frames terminates it way before 120ms.
-                # Perhaps "silence" means "RMS < threshold"?
-                # Let's stick to Condition 2 as it triggers first.
-                pass
+                curr_rms = timeline[i].rms
+                if curr_rms > active_peak_rms:
+                    active_peak_rms = curr_rms
+
+                # Relative drop check (Re-attack)
+                # If RMS drops below 20% of peak, or absolute low
+                if curr_rms < 0.05 or (active_peak_rms > 0.1 and curr_rms < 0.2 * active_peak_rms):
+                    should_end = True
 
             if should_end:
                 # Finalize note

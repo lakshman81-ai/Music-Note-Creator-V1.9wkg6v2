@@ -19,6 +19,7 @@ def transcribe_audio_pipeline(
     start_offset: Optional[float] = None, # ignored
     max_duration: Optional[float] = None, # ignored
     use_crepe: bool = False,
+    trim_silence: bool = True,
     **kwargs,
 ) -> TranscriptionResult:
     """
@@ -42,11 +43,14 @@ def transcribe_audio_pipeline(
 
     # 1. Stage A: Load and Preprocess
     # Robust loading and normalization
-    y, sr, meta = load_and_preprocess(audio_path, target_sr=22050)
+    y, sr, meta = load_and_preprocess(audio_path, target_sr=22050, trim_silence=trim_silence)
 
     # 2. Stage B: Extract Features (Segmentation)
     # Pitch tracking (pyin/crepe) and Hysteresis segmentation
     timeline, notes, chords = extract_features(y, sr, meta, use_crepe=use_crepe)
+
+    tracker_name = "crepe" if use_crepe else "pyin"
+    print(f"Notes extracted using: {tracker_name}")
 
     # 3. Build AnalysisData
     analysis_data = AnalysisData(
@@ -55,7 +59,7 @@ def transcribe_audio_pipeline(
         events=notes,
         chords=chords,
         notes=notes,
-        pitch_tracker="crepe" if use_crepe else "pyin",
+        pitch_tracker=tracker_name,
         n_frames=len(timeline),
         frame_hop_seconds=float(meta.hop_length) / float(meta.target_sr)
     )

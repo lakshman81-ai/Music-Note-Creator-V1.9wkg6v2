@@ -16,6 +16,7 @@ SILENCE_THRESHOLD_DB = 40  # top_db for trim
 def load_and_preprocess(
     audio_path: str,
     target_sr: int = 44100,
+    trim_silence: bool = True,
 ) -> Tuple[np.ndarray, int, MetaData]:
     """
     Stage A: Robust audio loading, silence trimming, mono conversion, resampling, and EBU R128 normalization.
@@ -65,7 +66,10 @@ def load_and_preprocess(
     # 3. Silence Trimming (Before Normalization)
     # librosa.effects.trim expects mono usually, or handles multi-channel
     # top_db=40 as requested
-    y_trimmed, trim_idx = librosa.effects.trim(y_mono, top_db=SILENCE_THRESHOLD_DB)
+    if trim_silence:
+        y_trimmed, trim_idx = librosa.effects.trim(y_mono, top_db=SILENCE_THRESHOLD_DB)
+    else:
+        y_trimmed = y_mono
 
     # Re-check duration after trim
     duration_sec = len(y_trimmed) / sr_orig
@@ -126,13 +130,17 @@ def load_and_preprocess(
     rms = np.sqrt(np.mean(y_final**2))
     rms_db = 20 * np.log10(rms) if rms > 0 else -80.0
 
+    # Determine hop length for roughly 10ms resolution
+    # 256 samples @ 22050Hz ~= 11.6ms
+    hop_len = 256
+
     meta = MetaData(
         original_sr=sr_orig,
         target_sr=target_sr,
         sample_rate=target_sr,
         duration_sec=duration_sec,
         window_size=1024,
-        hop_length=512,
+        hop_length=hop_len,
         time_signature="4/4",
         tempo_bpm=None,
         lufs=final_lufs,

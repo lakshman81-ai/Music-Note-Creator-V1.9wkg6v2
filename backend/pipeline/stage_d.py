@@ -16,7 +16,7 @@ def quantize_and_render(
 
     # Gap Merging
     # "Gap merging for notes separated by < 1/32 note"
-    # 1/32 note = 1/8 beat
+    # 1/32 note = 1/8 beat = 0.125
     gap_threshold_beats = 0.125
 
     merged_events = []
@@ -38,7 +38,9 @@ def quantize_and_render(
 
             # Check overlap? "No overlapping same-pitch notes"
             if next_note.midi_note == current_note.midi_note:
-                if gap_beats < gap_threshold_beats:
+                # Only merge if gap is small BUT NOT ZERO.
+                # Zero gap (touching) implies intentional repeated notes (quantized).
+                if 0 < gap_beats < gap_threshold_beats:
                     # Merge
                     current_note.end_sec = next_note.end_sec
                     # Update duration beats
