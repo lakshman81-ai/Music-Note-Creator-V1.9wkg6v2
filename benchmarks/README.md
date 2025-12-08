@@ -15,7 +15,7 @@ benchmarks/
   03_melody_plus_chords/
   04_pop_loops/
 ```
-
+Alternatively use MIDIs from https://github.com/bytedance/GiantMIDI-Piano/tree/master/midis_for_evaluation
 Add new scenarios by creating additional numbered folders that follow the same pattern (README + results.md + fixture subfolders).
 
 ## Naming conventions
