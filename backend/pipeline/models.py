@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any, Literal, Tuple
+from enum import Enum
+import numpy as np
 
 
 PitchName = Literal[
@@ -9,6 +11,10 @@ PitchName = Literal[
     "F#", "G", "G#", "A", "A#", "B"
 ]
 
+class AudioType(str, Enum):
+    MONOPHONIC = "monophonic"
+    POLYPHONIC_DOMINANT = "polyphonic_dominant"
+    POLYPHONIC = "polyphonic"
 
 # ---------- Meta / global info ----------
 
@@ -18,6 +24,7 @@ class MetaData:
     detected_key: str = "C"            # e.g. "C", "Gm"
     lufs: float = -14.0                # integrated loudness in LUFS
     processing_mode: str = "mono"      # "mono" | "stereo" | "polyphonic"
+    audio_type: AudioType = AudioType.MONOPHONIC # detected audio type
     snr: float = 0.0                   # signal-to-noise estimate
     window_size: int = 2048            # analysis window size
     hop_length: int = 512              # analysis hop length
@@ -36,6 +43,21 @@ class MetaData:
     normalization_gain_db: float = 0.0
     rms_db: float = -float('inf')
     pipeline_version: str = "2.0.0"
+
+
+# ---------- Stage A Output Structures ----------
+
+@dataclass
+class Stem:
+    audio: np.ndarray # Monophonic audio array
+    sr: int
+    name: str # 'vocals', 'bass', 'other', 'drums', or 'mix'
+
+@dataclass
+class StageAOutput:
+    stems: Dict[str, Stem] # keys: 'vocals', 'bass', 'other', 'drums', etc.
+    meta: MetaData
+    audio_type: AudioType
 
 
 # ---------- Pitch timeline ----------
