@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, Tuple
 
 
 PitchName = Literal[
@@ -47,6 +47,7 @@ class FramePitch:
     midi: Optional[int]                # None if unvoiced
     confidence: float                  # 0–1
     rms: float = 0.0                   # Frame RMS energy
+    active_pitches: List[Tuple[float, float]] = field(default_factory=list) # List of (pitch_hz, confidence)
 
 
 # ---------- Note events ----------
