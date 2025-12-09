@@ -1,8 +1,9 @@
 import numpy as np
 import librosa
+import scipy.signal
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 
 class BasePitchDetector:
     def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float):
@@ -11,9 +12,10 @@ class BasePitchDetector:
         self.fmin = fmin
         self.fmax = fmax
 
-    def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, y: np.ndarray) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
         """
         Returns (pitch_hz, confidence) per frame.
+        Can return lists of lists for polyphony.
         """
         raise NotImplementedError
 
@@ -46,9 +48,8 @@ class YinDetector(BasePitchDetector):
         return f0, voiced_probs
 
 class CQTDetector(BasePitchDetector):
-    def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, y: np.ndarray, polyphony: bool = False, max_peaks: int = 4) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
         # CQT Peak Tracker
-        # bins_per_octave = 36
         bins_per_octave = 36
 
         C = librosa.cqt(y, sr=self.sr, hop_length=self.hop_length, fmin=self.fmin,
@@ -56,27 +57,48 @@ class CQTDetector(BasePitchDetector):
 
         # Power spectrum
         magnitude = np.abs(C)
-
-        # For each frame, find bin with max magnitude
-        # This is a simple "Peak Tracker"
-
-        idx = np.argmax(magnitude, axis=0)
-        max_mag = np.max(magnitude, axis=0)
-
-        # Convert bin index to frequency
         freqs = librosa.cqt_frequencies(len(magnitude), fmin=self.fmin, bins_per_octave=bins_per_octave)
-        f0 = freqs[idx]
+        global_max = np.max(magnitude) if np.max(magnitude) > 0 else 1.0
 
-        # Confidence can be normalized magnitude?
-        # Normalize max_mag relative to global max or local?
-        # Let's normalize 0-1 based on global max for this clip
-        global_max = np.max(max_mag)
-        if global_max > 0:
+        if not polyphony:
+            # Monophonic fallback
+            idx = np.argmax(magnitude, axis=0)
+            max_mag = np.max(magnitude, axis=0)
+            f0 = freqs[idx]
             conf = max_mag / global_max
-        else:
-            conf = np.zeros_like(max_mag)
+            return f0, conf
 
-        return f0, conf
+        # Polyphonic Peak Extraction
+        pitches_list = []
+        confs_list = []
+
+        for t in range(magnitude.shape[1]):
+            frame_mag = magnitude[:, t]
+
+            # Find peaks
+            # Height threshold relative to global max or local?
+            # Using low relative threshold to capture quiet notes.
+            # distance=1 ensures we don't pick adjacent bins (unless close partials)
+            # Threshold 0.10, distance 18 (~6 semitones).
+            # Prioritizing harmonic suppression to improve precision.
+            peaks, properties = scipy.signal.find_peaks(frame_mag, height=global_max * 0.10, distance=18)
+
+            if len(peaks) > 0:
+                # Sort by height (magnitude)
+                peak_heights = properties['peak_heights']
+                sorted_indices = np.argsort(peak_heights)[::-1]
+                top_peaks = peaks[sorted_indices][:max_peaks]
+
+                frame_pitches = freqs[top_peaks].tolist()
+                frame_confs = (frame_mag[top_peaks] / global_max).tolist()
+            else:
+                frame_pitches = []
+                frame_confs = []
+
+            pitches_list.append(frame_pitches)
+            confs_list.append(frame_confs)
+
+        return pitches_list, confs_list
 
 class SpectralAutocorrDetector(BasePitchDetector):
     def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

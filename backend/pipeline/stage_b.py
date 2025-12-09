@@ -31,16 +31,19 @@ def extract_features(
     fmax = 2093.0 # C7
 
     # 1. Initialize Detectors
+    # We instantiate CQT separately for polyphony
+    cqt_det = CQTDetector(sr, hop_length, fmin, fmax)
+
     detectors = [
         ("YIN", YinDetector(sr, hop_length, fmin, fmax)),
-        ("CQT", CQTDetector(sr, hop_length, fmin, fmax)),
+        ("CQT", cqt_det),
         ("SAC", SpectralAutocorrDetector(sr, hop_length, fmin, fmax)),
         ("SwiftF0", SwiftF0Detector(sr, hop_length, fmin, fmax))
     ]
 
     # Run all detectors
     results = {}
-    max_len = 0
+    poly_results = {} # Store polyphonic outputs here
 
     # Get RMS for length reference and later usage
     # Use smaller frame_length for RMS to catch short dips (re-attacks)
@@ -49,16 +52,48 @@ def extract_features(
 
     for name, det in detectors:
         try:
-            p, c = det.predict(y)
-            # Align lengths
-            if len(p) > max_len:
-                p = p[:max_len]
-                c = c[:max_len]
-            elif len(p) < max_len:
-                p = np.pad(p, (0, max_len - len(p)))
-                c = np.pad(c, (0, max_len - len(c)))
+            if name == "CQT":
+                # Get both mono (for ensemble) and poly
+                p_poly, c_poly = det.predict(y, polyphony=True, max_peaks=4)
+                # For mono ensemble, we take the top peak if available, else 0
+                p = np.zeros(max_len)
+                c = np.zeros(max_len)
 
-            results[name] = (p, c)
+                # Align poly results to max_len
+                # p_poly is List[List[float]]
+
+                final_poly_p = []
+                final_poly_c = []
+
+                for i in range(max_len):
+                    if i < len(p_poly):
+                        pitches = p_poly[i]
+                        confs = c_poly[i]
+                        final_poly_p.append(pitches)
+                        final_poly_c.append(confs)
+
+                        # Populate mono for ensemble
+                        if len(pitches) > 0:
+                            p[i] = pitches[0]
+                            c[i] = confs[0]
+                    else:
+                        final_poly_p.append([])
+                        final_poly_c.append([])
+
+                poly_results["CQT"] = (final_poly_p, final_poly_c)
+                results[name] = (p, c)
+
+            else:
+                p, c = det.predict(y)
+                # Align lengths
+                if len(p) > max_len:
+                    p = p[:max_len]
+                    c = c[:max_len]
+                elif len(p) < max_len:
+                    p = np.pad(p, (0, max_len - len(p)))
+                    c = np.pad(c, (0, max_len - len(c)))
+
+                results[name] = (p, c)
         except Exception as e:
             print(f"Detector {name} failed: {e}")
             results[name] = (np.zeros(max_len), np.zeros(max_len))
@@ -181,12 +216,25 @@ def extract_features(
 
         m_val = hz_to_midi(final_pitch) if final_pitch > 0 else None
 
+        # Populate active_pitches from CQT Poly result
+        # Note: We trust CQT for polyphony for now.
+        # Ideally we would merge YIN/SwiftF0 into this list if they detect something different.
+        # But usually CQT captures the spectrum best for multiple notes.
+        active_pitches = []
+        if "CQT" in poly_results:
+             p_list = poly_results["CQT"][0][i]
+             c_list = poly_results["CQT"][1][i]
+             # Zip and add
+             for idx_p, val_p in enumerate(p_list):
+                 active_pitches.append((val_p, c_list[idx_p]))
+
         timeline.append(FramePitch(
             time=float(times[i]),
             pitch_hz=float(final_pitch),
             midi=int(round(m_val)) if m_val is not None else None,
             confidence=float(final_conf),
-            rms=float(rms_frames[i])
+            rms=float(rms_frames[i]),
+            active_pitches=active_pitches
         ))
 
     # Apply Median Smoothing to Pitch Trajectory
