@@ -142,6 +142,7 @@ class AnalysisData:
 
     # New fields
     notes: List[NoteEvent] = field(default_factory=list)
+    stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict)
 
     # Extended robust fields
     pitch_tracker: str = "pyin"  # "pyin" | "crepe"
