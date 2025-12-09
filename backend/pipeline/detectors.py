@@ -21,76 +21,189 @@ class BasePitchDetector:
 
 class YinDetector(BasePitchDetector):
     def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        # librosa.pyin or yin?
-        # Requirement says "YIN - classical time-domain...". librosa.yin is faster than pyin but pyin is "Probabilistic YIN".
-        # Prompt says "YIN (librosa)". Defaults: threshold=0.10, frame=2048, hop=512.
-        # librosa.yin returns f0. It does not return confidence directly, but we can estimate it or use pyin.
-        # "D1 — YIN". "threshold = 0.10".
-        # If we use librosa.yin, we get f0. We need confidence.
-        # Often YIN implementations return aperiodicity or similar. librosa.yin doesn't return confidence.
-        # librosa.pyin returns (f0, voiced_flag, voiced_probs).
-        # Let's use pyin as it provides confidence which is crucial for the ensemble.
-
         f0, voiced_flag, voiced_probs = librosa.pyin(
             y,
             fmin=self.fmin,
             fmax=self.fmax,
             sr=self.sr,
             hop_length=self.hop_length,
-            frame_length=2048, # YIN-compatible default
+            frame_length=2048,
             fill_na=0.0
         )
-
-        # Replace NaNs
         f0 = np.nan_to_num(f0)
         voiced_probs = np.nan_to_num(voiced_probs)
-
         return f0, voiced_probs
 
 class CQTDetector(BasePitchDetector):
     def predict(self, y: np.ndarray, polyphony: bool = False, max_peaks: int = 4) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
-        # CQT Peak Tracker
         bins_per_octave = 36
-
         C = librosa.cqt(y, sr=self.sr, hop_length=self.hop_length, fmin=self.fmin,
                         n_bins=bins_per_octave * 7, bins_per_octave=bins_per_octave)
-
-        # Power spectrum
         magnitude = np.abs(C)
         freqs = librosa.cqt_frequencies(len(magnitude), fmin=self.fmin, bins_per_octave=bins_per_octave)
         global_max = np.max(magnitude) if np.max(magnitude) > 0 else 1.0
 
         if not polyphony:
-            # Monophonic fallback
             idx = np.argmax(magnitude, axis=0)
             max_mag = np.max(magnitude, axis=0)
             f0 = freqs[idx]
             conf = max_mag / global_max
             return f0, conf
 
-        # Polyphonic Peak Extraction
         pitches_list = []
         confs_list = []
-
         for t in range(magnitude.shape[1]):
             frame_mag = magnitude[:, t]
-
-            # Find peaks
-            # Height threshold relative to global max or local?
-            # Using low relative threshold to capture quiet notes.
-            # distance=1 ensures we don't pick adjacent bins (unless close partials)
-            # Threshold 0.10, distance 18 (~6 semitones).
-            # Prioritizing harmonic suppression to improve precision.
             peaks, properties = scipy.signal.find_peaks(frame_mag, height=global_max * 0.10, distance=18)
-
             if len(peaks) > 0:
-                # Sort by height (magnitude)
                 peak_heights = properties['peak_heights']
                 sorted_indices = np.argsort(peak_heights)[::-1]
                 top_peaks = peaks[sorted_indices][:max_peaks]
-
                 frame_pitches = freqs[top_peaks].tolist()
                 frame_confs = (frame_mag[top_peaks] / global_max).tolist()
+            else:
+                frame_pitches = []
+                frame_confs = []
+            pitches_list.append(frame_pitches)
+            confs_list.append(frame_confs)
+        return pitches_list, confs_list
+
+class SpectralAutocorrDetector(BasePitchDetector):
+    """
+    Original HPS-based spectral detector.
+    Kept for legacy/ensemble use.
+    """
+    def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        S = np.abs(librosa.stft(y, n_fft=2048, hop_length=self.hop_length))
+        fft_freqs = librosa.fft_frequencies(sr=self.sr, n_fft=2048)
+        f0, conf = [], []
+        n_harmonics = 3
+
+        min_bin = np.searchsorted(fft_freqs, self.fmin)
+        max_bin = np.searchsorted(fft_freqs, self.fmax)
+
+        for t in range(S.shape[1]):
+            spectrum = S[:, t]
+            hps = spectrum.copy()
+            for h in range(2, n_harmonics + 1):
+                ds_spec = spectrum[::h]
+                hps[:len(ds_spec)] *= ds_spec
+
+            if max_bin > len(hps): max_bin = len(hps)
+            if min_bin >= max_bin:
+                f0.append(0.0); conf.append(0.0)
+                continue
+
+            peak_bin = min_bin + np.argmax(hps[min_bin:max_bin])
+            f_est = fft_freqs[peak_bin]
+            peak_mag = hps[peak_bin]
+            total_mag = np.sum(hps[min_bin:max_bin]) + 1e-9
+            c_est = peak_mag / total_mag
+            f0.append(f_est)
+            conf.append(c_est)
+
+        return np.array(f0), np.array(conf)
+
+class SACFDetector(BasePitchDetector):
+    """
+    Summary Autocorrelation Function (SACF) Detector.
+    Splits signal into Low/High bands, rectifies high band, sums ACFs.
+    Robust for polyphonic periodicity detection.
+    """
+    def predict(self, y: np.ndarray, polyphony: bool = True, max_peaks: int = 4) -> Tuple[List[List[float]], List[List[float]]]:
+        # 1. Band Splitting
+        # High-pass / Low-pass filters at 1000 Hz
+        nyquist = self.sr / 2
+        cutoff = 1000.0 / nyquist
+
+        # Check if filter valid
+        if cutoff >= 1.0:
+            # Signal SR too low, just use raw
+            y_lo = y
+            y_hi_env = np.zeros_like(y)
+        else:
+            b_lo, a_lo = scipy.signal.butter(2, cutoff, btype='low')
+            b_hi, a_hi = scipy.signal.butter(2, cutoff, btype='high')
+
+            y_lo = scipy.signal.lfilter(b_lo, a_lo, y)
+            y_hi = scipy.signal.lfilter(b_hi, a_hi, y)
+
+            # 2. Envelope Rectification (Half-wave)
+            # "The high-pass signal is half-wave rectified to extract its envelope"
+            y_hi_env = np.maximum(y_hi, 0)
+
+        # 3. Frame-wise Autocorrelation
+        # We need to window the signal
+        n_fft = 4096 # Report says 4096 for bass resolution
+        hop = self.hop_length
+
+        # We process frame by frame
+        # Pad y
+        y_lo_pad = np.pad(y_lo, (n_fft//2, n_fft//2))
+        y_hi_pad = np.pad(y_hi_env, (n_fft//2, n_fft//2))
+
+        pitches_list = []
+        confs_list = []
+
+        n_frames = (len(y) - 1) // hop + 1
+
+        # Lags
+        # Min lag = sr / fmax
+        # Max lag = sr / fmin
+        min_lag = int(self.sr / self.fmax)
+        max_lag = int(self.sr / self.fmin)
+
+        for i in range(n_frames):
+            start = i * hop
+            end = start + n_fft
+            if end > len(y_lo_pad): break
+
+            frame_lo = y_lo_pad[start:end]
+            frame_hi = y_hi_pad[start:end]
+
+            # Windowing
+            win = np.hanning(len(frame_lo))
+
+            # Autocorrelation via FFT
+            # ACF(x) = IFFT(|FFT(x)|^2)
+
+            def autocorr(x):
+                spec = np.fft.rfft(x * win, n=n_fft)
+                return np.fft.irfft(np.abs(spec)**2, n=n_fft)
+
+            acf_lo = autocorr(frame_lo)
+            acf_hi = autocorr(frame_hi)
+
+            # Sum SACF
+            sacf = acf_lo + acf_hi
+
+            # Normalize
+            sacf /= (np.max(sacf) + 1e-9)
+
+            # Time-Scaling (Octave Error Removal) - Optional but recommended in report
+            # "Subtracts the autocorrelation compressed by factor 2"
+            # sacf_clean = sacf - interp(sacf_scaled)
+            # Simplified: Just prune peaks later or implement basic pruning.
+            # Let's implement basic peak picking first.
+
+            # Find peaks in lag domain
+            # We only look between min_lag and max_lag
+            valid_sacf = sacf[min_lag:max_lag]
+            # Map back to global indices
+
+            peaks, properties = scipy.signal.find_peaks(valid_sacf, height=0.1)
+
+            if len(peaks) > 0:
+                peak_heights = properties['peak_heights']
+                # Sort
+                sorted_indices = np.argsort(peak_heights)[::-1]
+                top_peaks = peaks[sorted_indices][:max_peaks]
+
+                # Convert lags to Hz
+                # Global lag = peak_idx + min_lag
+                lags = top_peaks + min_lag
+                frame_pitches = [float(self.sr / l) for l in lags]
+                frame_confs = peak_heights[sorted_indices][:max_peaks].tolist()
             else:
                 frame_pitches = []
                 frame_confs = []
@@ -100,114 +213,109 @@ class CQTDetector(BasePitchDetector):
 
         return pitches_list, confs_list
 
-class SpectralAutocorrDetector(BasePitchDetector):
-    def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        # D3 — Spectral Autocorrelation
-        # Simple implementation: STFT -> Magnitude -> Autocorrelation on frequency axis?
-        # Or Time-domain autocorrelation (which is YIN-like)?
-        # "Spectral Autocorrelation — harmonic structure based" implies working on the spectrum.
-        # HPS (Harmonic Product Spectrum) is common.
-        # Or Autocorrelation of the spectrum itself?
+class ISSPolyphonicDetector(BasePitchDetector):
+    """
+    Iterative Spectral Subtraction Detector.
+    Wraps another detector (e.g. SwiftF0 or SACF) to extract multiple notes.
+    For simplicity, we implement the logic using spectral peak picking + subtraction here,
+    or we can wrap the SACF logic.
+    Report says: "The current signal buffer is analyzed... most salient pitch f1 identified... subtraction... repeat."
+    """
+    def predict(self, y: np.ndarray, max_iter: int = 4) -> Tuple[List[List[float]], List[List[float]]]:
+        # This operates frame-by-frame on the STFT.
+        S = librosa.stft(y, n_fft=2048, hop_length=self.hop_length)
+        mag = np.abs(S)
+        freqs = librosa.fft_frequencies(sr=self.sr, n_fft=2048)
 
-        # Let's implement HPS (Harmonic Product Spectrum) as a robust spectral method.
-        # 1. STFT
-        S = np.abs(librosa.stft(y, n_fft=2048, hop_length=self.hop_length))
+        pitches_list = []
+        confs_list = []
 
-        # 2. HPS: Downsample spectrum and multiply
-        # hps_spec = S * downsample(S, 2) * downsample(S, 3)...
-        # We need to map bins to Hz.
+        for t in range(mag.shape[1]):
+            frame_mag = mag[:, t].copy()
+            frame_pitches = []
+            frame_confs = []
 
-        f0 = []
-        conf = []
+            for _ in range(max_iter):
+                # 1. Find max peak
+                # Restrict to valid range
+                valid_mask = (freqs >= self.fmin) & (freqs <= self.fmax)
 
-        fft_freqs = librosa.fft_frequencies(sr=self.sr, n_fft=2048)
+                # Apply mask to current residual
+                masked_mag = frame_mag * valid_mask
+                if np.max(masked_mag) < 1e-4: # Silence threshold
+                    break
 
-        # Number of harmonics to consider
-        n_harmonics = 3
+                peak_idx = np.argmax(masked_mag)
+                peak_freq = freqs[peak_idx]
+                peak_val = masked_mag[peak_idx]
 
-        for t in range(S.shape[1]):
-            spectrum = S[:, t]
+                # Global max reference (from original frame?)
+                # Or relative to current residual?
+                # Using current peak val as confidence for this iteration
+                conf = peak_val # Normalize later?
 
-            # HPS
-            hps = spectrum.copy()
-            for h in range(2, n_harmonics + 1):
-                # Downsample by h
-                ds_spec = spectrum[::h]
-                # Truncate to match length
-                hps[:len(ds_spec)] *= ds_spec
+                if peak_val < 0.1: # Threshold (arbitrary for magnitude?)
+                     break # Stop if peak is too small
 
-            # Find max peak in HPS
-            # Restrict to fmin/fmax range bins
-            # fmin bin
-            min_bin = np.searchsorted(fft_freqs, self.fmin)
-            max_bin = np.searchsorted(fft_freqs, self.fmax)
+                frame_pitches.append(peak_freq)
+                frame_confs.append(peak_val)
 
-            if max_bin >= len(hps):
-                max_bin = len(hps) - 1
+                # 2. Subtract Harmonics
+                # "Mask Width... 3% of center freq"
+                # Remove f1, 2f1, 3f1...
+                # Simple integer multiples for now.
 
-            if min_bin >= max_bin:
-                f0.append(0.0)
-                conf.append(0.0)
-                continue
+                for h in range(1, 10): # 10 harmonics
+                    h_freq = peak_freq * h
+                    if h_freq > self.fmax: break
 
-            peak_bin = min_bin + np.argmax(hps[min_bin:max_bin])
+                    # Find bins near h_freq
+                    # Width +/- 3%
+                    width_hz = h_freq * 0.03
+                    f_low = h_freq - width_hz
+                    f_high = h_freq + width_hz
 
-            # Refine peak?
-            f_est = fft_freqs[peak_bin]
+                    # Zero out bins
+                    bin_mask = (freqs >= f_low) & (freqs <= f_high)
+                    frame_mag[bin_mask] *= 0.05 # Suppress heavily
 
-            # Confidence
-            peak_mag = hps[peak_bin]
-            total_mag = np.sum(hps[min_bin:max_bin]) + 1e-9
-            c_est = peak_mag / total_mag # Ratio of energy in peak
+            # Normalize confs by original max?
+            orig_max = np.max(mag[:, t]) if np.max(mag[:, t]) > 0 else 1.0
+            frame_confs = [c/orig_max for c in frame_confs]
 
-            f0.append(f_est)
-            conf.append(c_est)
+            pitches_list.append(frame_pitches)
+            confs_list.append(frame_confs)
 
-        return np.array(f0), np.array(conf)
+        return pitches_list, confs_list
 
 
 # --- Neural Detectors ---
 
 class SwiftF0Architecture(nn.Module):
-    """
-    Conceptual architecture for SwiftF0 (~95k params).
-    A simple CNN-RNN or pure CNN structure for pitch estimation.
-    """
     def __init__(self):
         super().__init__()
-        # Input: Mono audio frame (e.g. 1024 samples) or MelSpec?
-        # Assuming waveform input for speed/simplicity or MelSpec.
-        # Let's assume MelSpec input for standard pitch detectors.
-        # But description says "fast, high accuracy".
-
         self.conv_blocks = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=(3, 3), padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.MaxPool2d(2),
-
             nn.Conv2d(16, 32, kernel_size=(3, 3), padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
-
             nn.Conv2d(32, 64, kernel_size=(3, 3), padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
         )
-
-        self.gru = nn.GRU(64 * 4, 128, batch_first=True) # Dimension depends on input size
-        self.fc_pitch = nn.Linear(128, 360) # 360 bins (cents) or regression?
-        # Let's assume classification into bins or direct regression + confidence
+        self.gru = nn.GRU(64 * 4, 128, batch_first=True)
+        self.fc_pitch = nn.Linear(128, 360)
         self.fc_conf = nn.Linear(128, 1)
 
     def forward(self, x):
-        # x: (B, 1, F, T)
         B, C, F, T = x.shape
         x = self.conv_blocks(x)
-        # Flatten
-        x = x.permute(0, 3, 1, 2).reshape(B, T//8, -1) # adjust logic
+        x = x.permute(0, 3, 1, 2).reshape(B, T//8, -1)
         x, _ = self.gru(x)
         pitch = self.fc_pitch(x)
         conf = torch.sigmoid(self.fc_conf(x))
@@ -217,20 +325,9 @@ class SwiftF0Detector(BasePitchDetector):
     def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float):
         super().__init__(sr, hop_length, fmin, fmax)
         self.model = SwiftF0Architecture()
-        # self.model.load_state_dict(torch.load("swiftf0.pth")) # Placeholder
         self.model.eval()
 
     def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        # Since we don't have weights, we return a dummy "High Confidence" output
-        # if this were a real run, but since we want to test the pipeline logic:
-        # We will return 0s so it doesn't break, or maybe fallback to YIN if empty?
-        # The logic in Stage B handles "If SwiftF0 active...".
-        # For the purpose of this agent, I will output zeros,
-        # effectively making it "inactive" unless I mock it.
-        # However, to test the "Priority Rule", I should perhaps return something valid?
-        # No, "generate code". The code is the architecture.
-        # Without weights, it outputs garbage.
-
-        # Return zeros (silent)
+        # Placeholder prediction (silence)
         n_frames = len(y) // self.hop_length + 1
         return np.zeros(n_frames), np.zeros(n_frames)

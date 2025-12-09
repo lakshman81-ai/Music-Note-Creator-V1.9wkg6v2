@@ -48,44 +48,13 @@ def transcribe_audio_pipeline(
 
     meta = stage_a_out.meta
 
-    # Select audio for Stage B (Compatibility Layer)
-    # Since Stage B is not yet multi-stem aware, we pick the most relevant stem.
-    # If Polyphonic, we should ideally run Stage B on each stem and merge.
-    # For now, if "vocals" exists, use it (Monophonic pipeline).
-    # If "other" exists (Polyphonic), use it? Or use the mix?
-    # To avoid breaking existing tests/usage, let's look at the audio type.
-
-    if stage_a_out.audio_type == AudioType.MONOPHONIC:
-        y_for_stage_b = stage_a_out.stems["vocals"].audio
-        sr_for_stage_b = stage_a_out.stems["vocals"].sr
-    else:
-        # For polyphonic, ideally we use 'other' + 'vocals' + 'bass'.
-        # But Stage B expects a single array.
-        # Let's fallback to "vocals" if present, or "other" if not, or reconstruct mix?
-        # Actually, let's use the 'vocals' stem if available (since SwiftF0 is primary),
-        # but if we want to support polyphony, we might need to change Stage B signature.
-        # Since the task is "segregate and implement Stage 1", I will just pass the Vocals stem
-        # to ensure the pipeline runs, knowing that full polyphonic support requires Stage B updates.
-        # Alternatively, if we have stems, we could mix them back? No that defeats the purpose.
-
-        # NOTE: This is a temporary bridge.
-        if "vocals" in stage_a_out.stems:
-             y_for_stage_b = stage_a_out.stems["vocals"].audio
-             sr_for_stage_b = stage_a_out.stems["vocals"].sr
-        else:
-             # Fallback
-             y_for_stage_b = list(stage_a_out.stems.values())[0].audio
-             sr_for_stage_b = list(stage_a_out.stems.values())[0].sr
-
-    # Resample if needed to match what Stage B might expect (though Stage B usually takes any SR)
-    # Stage B uses 22050 internally or from meta. Let's ensure consistency.
-    # Actually Stage B takes (y, sr, meta).
-
     # 2. Stage B: Extract Features (Segmentation)
-    # Pitch tracking (pyin/crepe) and Hysteresis segmentation
-    timeline, notes, chords = extract_features(y_for_stage_b, sr_for_stage_b, meta, use_crepe=use_crepe)
+    # Pass the full StageAOutput object so Stage B can route stems correctly.
+    # Note: sr argument is now less relevant for StageAOutput input but kept for legacy signature compatibility.
+    # Stage B will look at meta.sample_rate or stem.sr
+    timeline, notes, chords = extract_features(stage_a_out, sr=22050, meta=meta, use_crepe=use_crepe)
 
-    tracker_name = "crepe" if use_crepe else "pyin"
+    tracker_name = "crepe" if use_crepe else "swiftf0+sacf"
     print(f"Notes extracted using: {tracker_name}")
 
     # 3. Build AnalysisData
