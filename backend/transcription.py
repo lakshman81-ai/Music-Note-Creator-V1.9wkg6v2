@@ -71,6 +71,7 @@ def transcribe_audio_pipeline(
         beat_stem_audio = stage_a_out.stems["vocals"].audio
 
     onsets = [] # Global fallback
+    beats = [] # Global beats
     tempo = 120.0
 
     if beat_stem_audio is not None and len(beat_stem_audio) > 0:
@@ -78,6 +79,7 @@ def transcribe_audio_pipeline(
         try:
             tempo_est, beat_frames = librosa.beat.beat_track(y=beat_stem_audio, sr=stage_a_out.meta.target_sr)
             tempo = float(tempo_est)
+            beats = librosa.frames_to_time(beat_frames, sr=stage_a_out.meta.target_sr).tolist()
         except Exception as e:
             print(f"Beat tracking failed: {e}")
 
@@ -115,7 +117,8 @@ def transcribe_audio_pipeline(
         pitch_tracker=tracker_name,
         n_frames=len(timeline),
         frame_hop_seconds=float(meta.hop_length) / float(meta.target_sr),
-        onsets=onsets
+        onsets=onsets,
+        beats=beats # Add beats
     )
 
     # Store pre-quantization notes

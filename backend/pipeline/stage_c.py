@@ -105,6 +105,7 @@ class HMMProcessor:
                              current_hz_sum = 0.0
                              current_count = 0
                              current_conf_sum = 0.0
+                             curr_avg_midi = 0.0
 
                      current_hz_sum += timeline[t].pitch_hz
                      current_midi_sum += new_midi
@@ -120,6 +121,7 @@ class HMMProcessor:
                     current_hz_sum = 0.0
                     current_count = 0
                     current_conf_sum = 0.0
+                    curr_avg_midi = 0.0
 
         # Close open note
         if current_note_start != -1:
@@ -347,6 +349,7 @@ def apply_theory(
 def quantize_notes(notes: List[NoteEvent], analysis_data: AnalysisData) -> List[NoteEvent]:
     """
     Quantize to 1/16th grid (PPQ 120).
+    Uses beats/onsets if available for grid alignment.
     """
     bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else 120.0
     quarter_dur = 60.0 / bpm
@@ -355,9 +358,44 @@ def quantize_notes(notes: List[NoteEvent], analysis_data: AnalysisData) -> List[
     ticks_per_measure = 480
     sec_per_tick = quarter_dur / ticks_per_quarter
 
+    # Grid Alignment Logic
+    # If we have detected beats, we can try to align the grid to the first beat.
+    grid_offset_sec = 0.0
+    if analysis_data.beats and len(analysis_data.beats) > 0:
+        # Assume the first beat is the start of a measure or beat.
+        # Ideally we find the 'downbeat', but for now align to first detected beat.
+        # But beat tracking can be noisy.
+        # Let's align such that the first note's start is closest to a grid point.
+        # Or just use the first beat time as an anchor?
+        # User requirement: "Use beats (timestamps) to align the quantization grid"
+
+        # Simple alignment: Shift time so that the first beat is at a beat boundary.
+        # But we modify the grid, not the notes? Or we modify notes relative to grid.
+        # Actually, simpler: define grid based on beats.
+        # But constant BPM implies linear grid.
+        # If we have variable beats, we should use a tempo map, but current architecture assumes constant BPM (MetaData.tempo_bpm).
+        # So we will just use a constant offset based on the first beat.
+
+        first_beat = analysis_data.beats[0]
+        # Align grid so that 'first_beat' lands on a quarter note tick.
+        # We can subtract first_beat from all note times, quantize, then add it back?
+        # Or just offset the grid.
+        grid_offset_sec = first_beat % quarter_dur
+        # If offset is large (close to quarter_dur), it might be 0.
+        if grid_offset_sec > quarter_dur / 2:
+            grid_offset_sec -= quarter_dur
+
+    # Apply offset to grid calculation:
+    # t_shifted = t - grid_offset
+    # ticks = t_shifted / sec_per_tick
+
     for note in notes:
-        start_ticks = round(note.start_sec / sec_per_tick)
-        end_ticks = round(note.end_sec / sec_per_tick)
+        # Align to grid
+        start_aligned = note.start_sec - grid_offset_sec
+        end_aligned = note.end_sec - grid_offset_sec
+
+        start_ticks = round(start_aligned / sec_per_tick)
+        end_ticks = round(end_aligned / sec_per_tick)
 
         # Snap to grid (30 ticks)
         start_ticks = round(start_ticks / ticks_per_sixteenth) * ticks_per_sixteenth
@@ -375,7 +413,7 @@ def quantize_notes(notes: List[NoteEvent], analysis_data: AnalysisData) -> List[
         dur_ticks = end_ticks - start_ticks
         note.duration_beats = float(dur_ticks) / ticks_per_quarter
 
-        note.start_sec = start_ticks * sec_per_tick
+        note.start_sec = (start_ticks * sec_per_tick) + grid_offset_sec
         note.end_sec = note.start_sec + (note.duration_beats * quarter_dur)
 
     return notes

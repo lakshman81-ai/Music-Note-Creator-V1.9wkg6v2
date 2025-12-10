@@ -52,7 +52,8 @@ def iterative_spectral_subtraction(
     sr: int,
     detector,
     max_polyphony: int = 4,
-    termination_conf: float = 0.15
+    termination_conf: float = 0.15,
+    audio_path: Optional[str] = None
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
     Performs ISS to extract multiple pitch trajectories.
@@ -66,7 +67,7 @@ def iterative_spectral_subtraction(
 
     for i in range(max_polyphony):
         # 1. Detect Pitch
-        f0, conf = detector.predict(y_resid)
+        f0, conf = detector.predict(y_resid, audio_path=audio_path)
 
         if np.mean(conf) < termination_conf and np.max(conf) < termination_conf * 1.5:
             break
@@ -84,7 +85,7 @@ def iterative_spectral_subtraction(
 def extract_features(
     stage_a_output: StageAOutput,
     use_crepe: bool = False, # Deprecated/Ignored
-) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]]:
+) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent], Dict[str, List[FramePitch]]]:
     """
     Stage B: Adaptive Pitch Detection (Stem-based).
     """
@@ -101,7 +102,7 @@ def extract_features(
         if name in stems:
             stem = stems[name]
             det = SwiftF0Detector(stem.sr, hop_length, fmin=40.0, fmax=2000.0) # Tuned range
-            f0, conf = det.predict(stem.audio)
+            f0, conf = det.predict(stem.audio, audio_path=meta.audio_path)
             stem_results[name] = [(f0, conf)]
 
     # 2. Other (SACF + ISS) or Mix in Fast Mode
@@ -125,12 +126,20 @@ def extract_features(
     if "other" in stems:
         stem = stems["other"]
         det = SACFDetector(stem.sr, hop_length, fmin=60.0, fmax=2000.0)
-        extracted_tracks = iterative_spectral_subtraction(stem.audio, stem.sr, det, max_polyphony=4)
+        extracted_tracks = iterative_spectral_subtraction(
+            stem.audio,
+            stem.sr,
+            det,
+            max_polyphony=4,
+            audio_path=meta.audio_path
+        )
         stem_results["other"] = extracted_tracks
 
     # 3. Merge into Timeline & Create Stem Timelines
     target_sr = meta.sample_rate
     target_hop = meta.hop_length
+
+    # Use meta.duration_sec to calculate frames
     n_frames_global = int(meta.duration_sec * target_sr / target_hop) + 1
     times_global = librosa.frames_to_time(np.arange(n_frames_global), sr=target_sr, hop_length=target_hop)
 
@@ -161,6 +170,9 @@ def extract_features(
     frame_pitches_map = [[] for _ in range(n_frames_global)]
 
     for name, tracks in stem_results.items():
+        # Even if name is not in current stems dict (might have been processed above),
+        # stem_results drives this loop. But we need original SR.
+        # Check if name in stems
         if name not in stems: continue
         stem_sr = stems[name].sr
         stem_hop = hop_length

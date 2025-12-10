@@ -150,6 +150,7 @@ class AnalysisData:
     stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict)
     stem_onsets: Dict[str, List[float]] = field(default_factory=dict)
     onsets: List[float] = field(default_factory=list)
+    beats: List[float] = field(default_factory=list) # Beat timestamps
 
     # Extended robust fields
     pitch_tracker: str = "pyin"  # "pyin" | "crepe"
@@ -198,6 +199,7 @@ class AnalysisData:
                 for c in self.chords
             ],
             "vexflow_layout": self.vexflow_layout.measures,
+            "beats": self.beats,
         }
 
 
