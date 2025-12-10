@@ -10,7 +10,7 @@ from enum import Enum
 import torch
 from demucs import pretrained
 from demucs.apply import apply_model
-from .models import MetaData, AudioType, Stem, StageAOutput
+from .models import MetaData, AudioType, AudioQuality, Stem, StageAOutput
 
 # Constants
 TARGET_LUFS = -23.0  # EBU R128 standard
@@ -129,6 +129,7 @@ def load_and_preprocess(
     audio_path: str,
     target_sr: int = 44100, # Defaulting to high quality as per report for Autocorr
     trim_silence: bool = True,
+    fast_mode: bool = False,
 ) -> StageAOutput:
     """
     Stage A: Robust audio loading, silence trimming, mono conversion, resampling,
@@ -151,6 +152,9 @@ def load_and_preprocess(
 
     # Duration Check
     duration_sec = float(y_orig.shape[-1]) / sr_orig
+    if duration_sec < MIN_DURATION_SEC:
+        raise ValueError(f"Audio too short: {duration_sec:.2f}s. Minimum is {MIN_DURATION_SEC}s.")
+
     if duration_sec > MAX_DURATION_SEC:
         warnings.warn(f"Audio too long: {duration_sec:.2f}s. Trimming to {MAX_DURATION_SEC}s.")
         limit_samples = int(MAX_DURATION_SEC * sr_orig)
@@ -187,22 +191,50 @@ def load_and_preprocess(
     # For Demucs, we feed the raw (trimmed) audio and it handles norm internally,
     # but let's normalize y_trimmed for consisten AudioType detection.
     meter = pyln.Meter(sr_orig)
-    loudness = meter.integrated_loudness(y_trimmed)
-    if not (np.isneginf(loudness) or loudness < -70.0):
-        y_norm = pyln.normalize.loudness(y_trimmed, loudness, TARGET_LUFS)
-        norm_gain = TARGET_LUFS - loudness
-    else:
+    try:
+        # Pyloudnorm requires minimal duration (default block size 0.4s)
+        # If too short, skip loudness measurement
+        if len(y_trimmed) / sr_orig < 0.4:
+             raise ValueError("Audio too short for EBU R128")
+
+        loudness = meter.integrated_loudness(y_trimmed)
+        if not (np.isneginf(loudness) or loudness < -70.0):
+            y_norm = pyln.normalize.loudness(y_trimmed, loudness, TARGET_LUFS)
+            norm_gain = TARGET_LUFS - loudness
+        else:
+            y_norm = y_trimmed
+            norm_gain = 0.0
+    except Exception as e:
+        warnings.warn(f"Loudness normalization skipped: {e}")
         y_norm = y_trimmed
         norm_gain = 0.0
 
-    # 5. Audio Type Detection
+    # 5. Audio Type & Quality Detection
     audio_type = detect_audio_type(y_norm, sr_orig)
     print(f"Detected Audio Type: {audio_type}")
+
+    # Extension Check
+    ext = os.path.splitext(audio_path)[1].lower()
+    if ext in ['.wav', '.flac', '.aiff']:
+        audio_quality = AudioQuality.LOSSLESS
+    elif ext in ['.mp3', '.m4a', '.ogg']:
+        audio_quality = AudioQuality.LOSSY
+    else:
+        # Default fallback
+        audio_quality = AudioQuality.LOSSLESS
+    print(f"Detected Audio Quality: {audio_quality}")
 
     stems_output = {}
 
     # 6. Branching Logic
-    if audio_type == AudioType.MONOPHONIC:
+    # Force Monophonic path if Fast Mode
+    if fast_mode:
+        print("Fast Mode enabled: Skipping Demucs, treating as Monophonic mix.")
+        audio_type_to_use = AudioType.MONOPHONIC
+    else:
+        audio_type_to_use = audio_type
+
+    if audio_type_to_use == AudioType.MONOPHONIC:
         # Path A: Monophonic
         # Resample to 16kHz for SwiftF0
         if sr_orig != 16000:
@@ -241,7 +273,7 @@ def load_and_preprocess(
         original_sr=sr_orig,
         target_sr=target_sr,
         sample_rate=target_sr, # Global target
-        duration_sec=duration_sec,
+        duration_sec=len(y_norm) / sr_orig, # Use trimmed/processed duration
         window_size=1024,
         hop_length=256,
         time_signature="4/4",
@@ -249,6 +281,7 @@ def load_and_preprocess(
         lufs=TARGET_LUFS,
         processing_mode=audio_type.value,
         audio_type=audio_type,
+        audio_quality=audio_quality,
         audio_path=audio_path,
         n_channels=n_channels,
         normalization_gain_db=norm_gain,

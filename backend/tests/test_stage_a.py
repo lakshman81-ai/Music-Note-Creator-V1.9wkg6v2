@@ -30,8 +30,13 @@ def silence_padded_wav_file(tmp_path):
     return str(path)
 
 def test_load_and_preprocess_success(temp_wav_file):
-    y, sr, meta = load_and_preprocess(temp_wav_file)
-    assert sr == 44100
+    stage_a_out = load_and_preprocess(temp_wav_file)
+    # y, sr are now in stems['vocals'] (monophonic)
+    assert 'vocals' in stage_a_out.stems
+    y = stage_a_out.stems['vocals'].audio
+    sr = stage_a_out.stems['vocals'].sr
+    meta = stage_a_out.meta
+
     assert len(y) > 0
     assert meta.target_sr == 44100
     # Check normalization
@@ -43,14 +48,17 @@ def test_load_fallback_soundfile(tmp_path):
     sf.write(str(path), np.random.uniform(-0.1, 0.1, 22050), 22050)
 
     with patch('librosa.load', side_effect=Exception("Librosa fail")):
-        y, sr, meta = load_and_preprocess(str(path))
+        stage_a_out = load_and_preprocess(str(path))
+        y = stage_a_out.stems['vocals'].audio
+        meta = stage_a_out.meta
         assert len(y) > 0
         assert meta.audio_path == str(path)
 
 def test_silence_trimming(silence_padded_wav_file):
     # The file has 0.5s silence at start/end.
     # trimming should remove most of it.
-    y, sr, meta = load_and_preprocess(silence_padded_wav_file)
+    stage_a_out = load_and_preprocess(silence_padded_wav_file)
+    meta = stage_a_out.meta
 
     # Original length was 2.0s. Trimmed should be around 1.0s.
     # Allowing some margin for transitions

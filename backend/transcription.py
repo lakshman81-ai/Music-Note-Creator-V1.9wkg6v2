@@ -5,6 +5,7 @@ import tempfile
 import os
 import shutil
 import librosa
+import numpy as np
 
 from .pipeline.stage_a import load_and_preprocess
 from .pipeline.stage_b import extract_features
@@ -21,6 +22,7 @@ def transcribe_audio_pipeline(
     max_duration: Optional[float] = None, # ignored
     use_crepe: bool = False,
     trim_silence: bool = True,
+    mode: str = "quality", # "quality" or "fast"
     **kwargs,
 ) -> TranscriptionResult:
     """
@@ -44,9 +46,10 @@ def transcribe_audio_pipeline(
 
     # 1. Stage A: Load and Preprocess (with Source Separation)
     # Returns StageAOutput
-    stage_a_out = load_and_preprocess(audio_path, target_sr=22050, trim_silence=trim_silence)
+    stage_a_out = load_and_preprocess(audio_path, target_sr=22050, trim_silence=trim_silence, fast_mode=(mode == "fast"))
 
     meta = stage_a_out.meta
+    meta.processing_mode = mode
 
     # 2. Stage B: Extract Features (Segmentation)
     # Pitch tracking (SwiftF0/SACF) and Hysteresis segmentation
@@ -56,17 +59,63 @@ def transcribe_audio_pipeline(
     tracker_name = "swiftf0+sacf"
     print(f"Notes extracted using: {tracker_name}")
 
+    # 3. Beat Tracking & Onsets (Stage B/Prep)
+    # We need to extract beats and onsets for Stage C.
+
+    beat_stem_audio = None
+    if "drums" in stage_a_out.stems:
+        beat_stem_audio = stage_a_out.stems["drums"].audio
+    elif "other" in stage_a_out.stems: # If no drums (e.g. just other?)
+        beat_stem_audio = stage_a_out.stems["other"].audio
+    elif "vocals" in stage_a_out.stems: # Mono mix
+        beat_stem_audio = stage_a_out.stems["vocals"].audio
+
+    onsets = [] # Global fallback
+    tempo = 120.0
+
+    if beat_stem_audio is not None and len(beat_stem_audio) > 0:
+        # Beat Track
+        try:
+            tempo_est, beat_frames = librosa.beat.beat_track(y=beat_stem_audio, sr=stage_a_out.meta.target_sr)
+            tempo = float(tempo_est)
+        except Exception as e:
+            print(f"Beat tracking failed: {e}")
+
+        # Global Onset Detect (fallback)
+        try:
+            onsets = sorted(list(librosa.onset.onset_detect(y=beat_stem_audio, sr=stage_a_out.meta.target_sr, units='time')))
+        except:
+            pass
+
+    meta.tempo_bpm = tempo
+
+    # Populate stem_onsets
+    stem_onsets = {}
+    for s_name in ["vocals", "bass", "other"]:
+        if s_name in stage_a_out.stems:
+             try:
+                 y_s = stage_a_out.stems[s_name].audio
+                 if len(y_s) > 0:
+                     ons = librosa.onset.onset_detect(y=y_s, sr=stage_a_out.meta.target_sr, units='time')
+                     stem_onsets[s_name] = sorted(list(ons))
+                 else:
+                     stem_onsets[s_name] = []
+             except:
+                 stem_onsets[s_name] = []
+
     # 3. Build AnalysisData
     analysis_data = AnalysisData(
         meta=meta,
         timeline=timeline,
         stem_timelines=stem_timelines,
+        stem_onsets=stem_onsets,
         events=notes,
         chords=chords,
         notes=notes,
         pitch_tracker=tracker_name,
         n_frames=len(timeline),
-        frame_hop_seconds=float(meta.hop_length) / float(meta.target_sr)
+        frame_hop_seconds=float(meta.hop_length) / float(meta.target_sr),
+        onsets=onsets
     )
 
     # Store pre-quantization notes
