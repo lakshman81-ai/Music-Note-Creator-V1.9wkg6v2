@@ -9,6 +9,9 @@ import music21
 from typing import Optional, Tuple, List, Union, Dict, Set
 from collections import defaultdict
 
+def midi_to_hz(midi: float) -> float:
+    return 440.0 * (2.0 ** ((midi - 69.0) / 12.0))
+
 class BasePitchDetector:
     def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float):
         self.sr = sr
@@ -59,7 +62,7 @@ class CQTDetector(BasePitchDetector):
 
         for t in range(magnitude.shape[1]):
             frame_mag = magnitude[:, t]
-            peaks, properties = scipy.signal.find_peaks(frame_mag, height=global_max * 0.10, distance=18)
+            peaks, properties = scipy.signal.find_peaks(frame_mag, height=global_max * 0.10, distance=5)
 
             if len(peaks) > 0:
                 peak_heights = properties['peak_heights']

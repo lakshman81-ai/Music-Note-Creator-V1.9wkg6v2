@@ -242,7 +242,7 @@ def load_and_preprocess(
         else:
             y_16k = y_norm
 
-        stems_output["vocals"] = Stem(audio=y_16k, sr=16000, name="vocals")
+        stems_output["vocals"] = Stem(audio=y_16k, sr=16000, type="vocals")
         # Provide others as empty or copies?
         # Ideally, we just provide the main one.
 
@@ -257,16 +257,16 @@ def load_and_preprocess(
         for name in ["vocals", "bass"]:
             s = demucs_stems[name]
             s_16k = librosa.resample(s, orig_sr=44100, target_sr=16000) # Demucs usually outputs 44.1k
-            stems_output[name] = Stem(audio=s_16k, sr=16000, name=name)
+            stems_output[name] = Stem(audio=s_16k, sr=16000, type=name)
 
         # Other -> 44.1kHz + Whitening (for SACF)
         other = demucs_stems["other"]
         # Whitening
         other_white = warped_linear_prediction(other, sr=44100)
-        stems_output["other"] = Stem(audio=other_white, sr=44100, name="other")
+        stems_output["other"] = Stem(audio=other_white, sr=44100, type="other")
 
         # Drums -> Keep raw or discard? Keep for reference.
-        stems_output["drums"] = Stem(audio=demucs_stems["drums"], sr=44100, name="drums")
+        stems_output["drums"] = Stem(audio=demucs_stems["drums"], sr=44100, type="drums")
 
     # Meta Data Construction
     meta = MetaData(
