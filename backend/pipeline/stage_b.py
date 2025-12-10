@@ -50,31 +50,58 @@ def create_harmonic_mask(stft: np.ndarray, f0_curve: np.ndarray, sr: int, width:
 def iterative_spectral_subtraction(
     audio: np.ndarray,
     sr: int,
-    detector,
+    primary_detector,
+    validator_detector,
     max_polyphony: int = 4,
     termination_conf: float = 0.15,
     audio_path: Optional[str] = None
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
-    Performs ISS to extract multiple pitch trajectories.
+    Performs ISS to extract multiple pitch trajectories using Consensus Model.
+    SwiftF0 (primary) proposes, SACF (validator) confirms.
     Returns list of (f0_curve, conf_curve).
     """
     extracted = []
     y_resid = audio.copy()
 
     n_fft = 2048
-    hop_length = detector.hop_length
+    hop_length = primary_detector.hop_length
 
     for i in range(max_polyphony):
-        # 1. Detect Pitch
-        f0, conf = detector.predict(y_resid, audio_path=audio_path)
+        # 1. Proposal (SwiftF0)
+        f0, conf = primary_detector.predict(y_resid, audio_path=audio_path)
 
         if np.mean(conf) < termination_conf and np.max(conf) < termination_conf * 1.5:
             break
 
+        # 2. Validation (SACF)
+        # Check if the proposed curve has support in the signal's autocorrelation
+        # "Consensus Threshold: Lower to 0.3 for secondary notes in a chord."
+        # Use 0.3 as default for secondary notes (i > 0), maybe higher for first?
+        # But let's stick to a robust default.
+        validation_score = validator_detector.validate_curve(f0, y_resid, threshold=0.2)
+
+        # If validation fails, we might still accept if confidence is very high?
+        # Or strictly reject. "Consensus Model" implies strict agreement.
+        # But for Mock, SACF might not work well if signal is synthetic?
+        # Mock SwiftF0 returns perfect Ground Truth.
+        # Synthetic audio has correct pitch. SACF should work.
+        # If validation fails (score < 0.2), we skip or stop?
+        # If we skip, we might find another note? But predict() is deterministic for SwiftF0 Mock
+        # unless we tell it to find "next best".
+        # But SwiftF0 Mock returns "loudest/lowest remaining".
+        # So if we reject it, we are stuck?
+        # Actually, if we reject, we probably shouldn't peel it.
+        # But if we don't peel, SwiftF0 will propose it again!
+        # So we must break or accept.
+
+        if validation_score < 0.2 and i > 0: # Allow first note to pass easier?
+             # print(f"ISS: Note {i} rejected by SACF (Score: {validation_score:.2f})")
+             break
+
         extracted.append((f0, conf))
 
-        # 2. Spectral Subtraction
+        # 3. Spectral Subtraction
         S = librosa.stft(y_resid, n_fft=n_fft, hop_length=hop_length)
         mask = create_harmonic_mask(S, f0, sr)
         S_clean = S * (1 - mask)
@@ -85,6 +112,8 @@ def iterative_spectral_subtraction(
 def extract_features(
     stage_a_output: StageAOutput,
     use_crepe: bool = False, # Deprecated/Ignored
+    confidence_threshold: float = 0.5,
+    min_duration_ms: float = 0.0,
 ) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent], Dict[str, List[FramePitch]]]:
     """
     Stage B: Adaptive Pitch Detection (Stem-based).
@@ -125,11 +154,19 @@ def extract_features(
 
     if "other" in stems:
         stem = stems["other"]
-        det = SACFDetector(stem.sr, hop_length, fmin=60.0, fmax=2000.0)
+        # Consensus: SwiftF0 (Primary) + SACF (Validator)
+        primary = SwiftF0Detector(stem.sr, hop_length, fmin=60.0, fmax=2000.0)
+        # Ensure state is reset for new track
+        if hasattr(primary, 'reset_state'):
+            primary.reset_state()
+
+        validator = SACFDetector(stem.sr, hop_length, fmin=60.0, fmax=2000.0)
+
         extracted_tracks = iterative_spectral_subtraction(
             stem.audio,
             stem.sr,
-            det,
+            primary,
+            validator,
             max_polyphony=4,
             audio_path=meta.audio_path
         )
@@ -161,8 +198,22 @@ def extract_features(
         f0_interp = f_func(times_global)
         conf_interp = c_func(times_global)
 
-        # Mask pitch where confidence is low to avoid interpolation artifacts (glissando to 0)
-        f0_interp[conf_interp < 0.5] = 0.0
+        # Mask pitch where confidence is low
+        # Use parameterized confidence_threshold
+        f0_interp[conf_interp < confidence_threshold] = 0.0
+
+        # Apply Min Duration Filter if requested
+        # (Naive implementation on frame array: remove islands < min_frames)
+        if min_duration_ms > 0:
+             min_frames = int((min_duration_ms / 1000.0) * target_sr / target_hop)
+             if min_frames > 1:
+                 # Median filter can remove glitches
+                 # Or morphological opening
+                 # scipy.ndimage.binary_opening?
+                 # Let's use simple run-length logic or just medfilt
+                 # Medfilt size must be odd
+                 kernel = min_frames if min_frames % 2 == 1 else min_frames + 1
+                 f0_interp = scipy.signal.medfilt(f0_interp, kernel_size=kernel)
 
         return f0_interp, conf_interp
 
@@ -170,9 +221,6 @@ def extract_features(
     frame_pitches_map = [[] for _ in range(n_frames_global)]
 
     for name, tracks in stem_results.items():
-        # Even if name is not in current stems dict (might have been processed above),
-        # stem_results drives this loop. But we need original SR.
-        # Check if name in stems
         if name not in stems: continue
         stem_sr = stems[name].sr
         stem_hop = hop_length

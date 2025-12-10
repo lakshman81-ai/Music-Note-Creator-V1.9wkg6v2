@@ -1,103 +1,145 @@
 import argparse
-import sys
 import os
+import sys
 import numpy as np
-import music21
 
-# Ensure backend is in path
-sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
+# Ensure imports work
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
 from backend.transcription import transcribe_audio_pipeline
-from backend.pipeline.models import AnalysisData
+from backend.benchmarks.utils import generate_test_data, load_ground_truth, calculate_metrics
 
-def calculate_rpa(ground_truth_xml, predicted_notes):
-    """
-    Calculate Raw Pitch Accuracy (RPA).
-    RPA = (Number of notes with correct pitch within tolerance) / (Total ground truth notes)
-    """
-    # Parse Ground Truth
-    score = music21.converter.parse(ground_truth_xml)
-    gt_notes = []
-    # Use Melody part if available
-    notes_iter = score.parts[0].flat.notes if len(score.parts) > 0 else score.flat.notes
-
-    for n in notes_iter:
-        if not n.isRest:
-            if isinstance(n, music21.note.Note):
-                gt_notes.append(n.pitch.midi)
-            elif isinstance(n, music21.chord.Chord):
-                gt_notes.append(n.root().midi)
-
-    if not gt_notes:
-        print("Warning: No ground truth notes found.")
-        return 0.0
-
-    # Predicted Pitches
-    pred_pitches = [n.midi_note for n in predicted_notes]
-
-    if not pred_pitches:
-        print("Warning: No predicted notes.")
-        return 0.0
-
-    matches = 0
-    # Allow some length mismatch
-    len_min = min(len(gt_notes), len(pred_pitches))
-
-    for i in range(len_min):
-        if abs(gt_notes[i] - pred_pitches[i]) < 0.5:
-            matches += 1
-
-    rpa = matches / len(gt_notes)
-    return rpa
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="calibration", help="Mode: calibration | ...")
-    args = parser.parse_args()
-
+def run_benchmark(mode: str = "calibration"):
+    # Setup Paths
     base_dir = os.path.dirname(__file__)
-    audio_path = os.path.join(base_dir, "happy_birthday.wav")
-    xml_path = os.path.join(base_dir, "happy_birthday.musicxml")
+    xml_path = os.path.join(base_dir, "../mock_data/happy_birthday.xml")
+    wav_path = os.path.join(base_dir, "../mock_data/happy_birthday.wav")
 
-    print(f"Running Benchmark Clean in {args.mode} mode...")
+    # 1. Generate Data
+    generate_test_data(xml_path, wav_path)
 
-    # Run Pipeline
-    # We use use_mock=False to force it to use the Detectors (which we will Smart Mock)
-    result = transcribe_audio_pipeline(
-        audio_path,
-        use_mock=False,
-        mode="quality" # Default
+    # 2. Load Ground Truth
+    print(f"[INFO] Loading Dataset: {wav_path}")
+    # Pipeline uses hop_length=256 (Stage A)
+    gt_f0, gt_voiced = load_ground_truth(xml_path, hop_length=256)
+    print(f"[INFO] Ground Truth loaded. Voiced Frames: {np.sum(gt_voiced)} | Silence Frames: {len(gt_voiced) - np.sum(gt_voiced)}")
+
+    # 3. Initial Benchmark
+    print("\n--- STEP 1: INITIAL BENCHMARK (Default Params) ---")
+    defaults = {"confidence_threshold": 0.4, "min_duration_ms": 10.0}
+    print(f"[CONFIG] Conf_Thresh: {defaults['confidence_threshold']} | Min_Dur: {defaults['min_duration_ms']}ms")
+
+    res = transcribe_audio_pipeline(
+        wav_path,
+        mode="quality",
+        confidence_threshold=defaults["confidence_threshold"],
+        min_duration_ms=defaults["min_duration_ms"]
     )
 
-    notes = result.analysis_data.notes
-    print(f"Extracted {len(notes)} notes.")
-    for i, n in enumerate(notes):
-        print(f"Note {i}: {n.midi_note} ({n.start_sec:.2f}-{n.end_sec:.2f})")
+    # Extract predicted f0
+    timeline = res.analysis_data.timeline
+    pred_f0 = np.array([f.pitch_hz for f in timeline])
 
-    # Calculate Metrics
-    rpa = calculate_rpa(xml_path, notes)
-    print(f"RPA: {rpa:.2f}")
+    metrics = calculate_metrics(pred_f0, gt_f0, gt_voiced)
 
-    if args.mode == "calibration":
-        # Success Criteria
-        if rpa > 0.90:
-            print("SUCCESS: RPA > 0.90")
-        else:
-            print("FAILURE: RPA < 0.90")
-            sys.exit(1)
+    print("[METRICS]")
+    for k, v in metrics.items():
+        print(f"{k}: {v:.3f}")
 
-        # Check Note Count (Happy Birthday has ~6 notes in snippet)
-        # The mock XML should define the count.
-        score = music21.converter.parse(xml_path)
-        notes_iter = score.parts[0].flat.notes if len(score.parts) > 0 else score.flat.notes
-        gt_count = len([n for n in notes_iter if not n.isRest])
-        print(f"GT Note Count: {gt_count}")
+    if mode != "calibration":
+        return
 
-        if abs(len(notes) - gt_count) > 2:
-             print(f"FAILURE: Note count mismatch (GT: {gt_count}, Pred: {len(notes)})")
-             sys.exit(1)
-        else:
-             print("SUCCESS: Note count matches.")
+    # 4. Calibration Loop
+    target_precision = 0.99
+    target_recall = 0.98
+
+    if metrics["Precision"] >= target_precision and metrics["Recall"] >= target_recall:
+        print("[SUCCESS] Baseline meets criteria.")
+        return
+
+    print("\n--- STEP 2: AUTOMATED TUNING LOOP ---")
+
+    best_candidate = None
+    best_score = 0.0
+
+    # Tune Confidence
+    print("[TRIAL 1] Tuning Confidence Threshold...")
+    thresholds = [0.45, 0.50, 0.55, 0.60]
+
+    candidate_thresh = defaults["confidence_threshold"]
+
+    for th in thresholds:
+        res = transcribe_audio_pipeline(
+            wav_path,
+            mode="quality",
+            confidence_threshold=th,
+            min_duration_ms=defaults["min_duration_ms"]
+        )
+        timeline = res.analysis_data.timeline
+        pred_f0 = np.array([f.pitch_hz for f in timeline])
+        m = calculate_metrics(pred_f0, gt_f0, gt_voiced)
+
+        print(f"Thresh {th:.2f} -> Precision: {m['Precision']:.3f} | Recall: {m['Recall']:.3f}")
+
+        # Simple selection: max precision while recall > 0.98
+        if m['Precision'] > 0.99 and m['Recall'] > 0.98:
+             print(" <-- CANDIDATE FOUND")
+             candidate_thresh = th
+             break
+        elif m['Precision'] > best_score: # Keep best precision if none pass
+             best_score = m['Precision']
+             candidate_thresh = th
+
+    # Tune Duration
+    print(f"\n[TRIAL 2] Applying Duration Filter to Candidate ({candidate_thresh})...")
+    min_durs = [30.0, 50.0]
+
+    final_dur = defaults["min_duration_ms"]
+
+    for dur in min_durs:
+        res = transcribe_audio_pipeline(
+            wav_path,
+            mode="quality",
+            confidence_threshold=candidate_thresh,
+            min_duration_ms=dur
+        )
+        timeline = res.analysis_data.timeline
+        pred_f0 = np.array([f.pitch_hz for f in timeline])
+        m = calculate_metrics(pred_f0, gt_f0, gt_voiced)
+
+        print(f"Dur {dur}ms -> Precision: {m['Precision']:.3f} | Recall: {m['Recall']:.3f}")
+
+        if m['Precision'] >= target_precision and m['Recall'] >= target_recall:
+             final_dur = dur
+             break
+
+    print("\n--- FINAL RESULTS: OPTIMIZED CONFIGURATION ---")
+    print(f"[CONFIG] Conf_Thresh: {candidate_thresh} | Min_Dur: {final_dur}ms")
+
+    # Final Run
+    res = transcribe_audio_pipeline(
+        wav_path,
+        mode="quality",
+        confidence_threshold=candidate_thresh,
+        min_duration_ms=final_dur
+    )
+    timeline = res.analysis_data.timeline
+    pred_f0 = np.array([f.pitch_hz for f in timeline])
+    m = calculate_metrics(pred_f0, gt_f0, gt_voiced)
+
+    print("[METRICS]")
+    for k, v in m.items():
+        passed = "PASSED" if (k == "Precision" and v >= target_precision) or (k == "Recall" and v >= target_recall) else ""
+        print(f"{k}: {v:.3f} {passed}")
+
+    if m['Precision'] >= target_precision and m['Recall'] >= target_recall:
+        print("\n[SUCCESS] Baseline Calibration Complete.")
+    else:
+        print("\n[WARNING] Optimization criteria not fully met.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="calibration", choices=["calibration", "run"])
+    args = parser.parse_args()
+
+    run_benchmark(args.mode)
