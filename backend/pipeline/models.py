@@ -16,6 +16,10 @@ class AudioType(str, Enum):
     POLYPHONIC_DOMINANT = "polyphonic_dominant"
     POLYPHONIC = "polyphonic"
 
+class AudioQuality(str, Enum):
+    LOSSLESS = "lossless"  # WAV, FLAC, AIFF
+    LOSSY = "lossy"        # MP3, M4A, OGG
+
 # ---------- Meta / global info ----------
 
 @dataclass
@@ -25,6 +29,7 @@ class MetaData:
     lufs: float = -14.0                # integrated loudness in LUFS
     processing_mode: str = "mono"      # "mono" | "stereo" | "polyphonic"
     audio_type: AudioType = AudioType.MONOPHONIC # detected audio type
+    audio_quality: AudioQuality = AudioQuality.LOSSLESS # detected audio quality
     snr: float = 0.0                   # signal-to-noise estimate
     window_size: int = 2048            # analysis window size
     hop_length: int = 512              # analysis hop length
@@ -143,6 +148,8 @@ class AnalysisData:
     # New fields
     notes: List[NoteEvent] = field(default_factory=list)
     stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict)
+    stem_onsets: Dict[str, List[float]] = field(default_factory=dict)
+    onsets: List[float] = field(default_factory=list)
 
     # Extended robust fields
     pitch_tracker: str = "pyin"  # "pyin" | "crepe"

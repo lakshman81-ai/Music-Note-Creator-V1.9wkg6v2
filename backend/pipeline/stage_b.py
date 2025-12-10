@@ -2,7 +2,8 @@ from typing import List, Tuple, Optional, Dict
 import numpy as np
 import librosa
 import scipy.signal
-from .models import MetaData, FramePitch, NoteEvent, ChordEvent, StageAOutput, Stem
+import scipy.interpolate
+from .models import MetaData, FramePitch, NoteEvent, ChordEvent, StageAOutput, Stem, AudioQuality
 from .detectors import YinDetector, CQTDetector, SACFDetector, SwiftF0Detector
 
 def midi_to_hz(midi: float) -> float:
@@ -22,9 +23,6 @@ def create_harmonic_mask(stft: np.ndarray, f0_curve: np.ndarray, sr: int, width:
     fft_freqs = librosa.fft_frequencies(sr=sr, n_fft=(n_freqs - 1) * 2)
     mask = np.zeros_like(stft, dtype=np.float32)
 
-    # We can optimize this using broadcasting or process frame-by-frame
-    # Frame-by-frame is easier to read and implement correctly for varying f0
-
     for t in range(min(n_frames, len(f0_curve))):
         f0 = f0_curve[t]
         if f0 <= 0:
@@ -41,7 +39,6 @@ def create_harmonic_mask(stft: np.ndarray, f0_curve: np.ndarray, sr: int, width:
             f_high = h_freq + bw/2
 
             # Find bins
-            # np.searchsorted is fast
             idx_start = np.searchsorted(fft_freqs, f_low)
             idx_end = np.searchsorted(fft_freqs, f_high)
 
@@ -64,7 +61,6 @@ def iterative_spectral_subtraction(
     extracted = []
     y_resid = audio.copy()
 
-    # Pre-calculate STFT parameters to ensure consistency
     n_fft = 2048
     hop_length = detector.hop_length
 
@@ -72,26 +68,15 @@ def iterative_spectral_subtraction(
         # 1. Detect Pitch
         f0, conf = detector.predict(y_resid)
 
-        # Check termination (if mean confidence is too low)
-        # Or if no voiced frames
         if np.mean(conf) < termination_conf and np.max(conf) < termination_conf * 1.5:
             break
 
         extracted.append((f0, conf))
 
         # 2. Spectral Subtraction
-        # Compute STFT
         S = librosa.stft(y_resid, n_fft=n_fft, hop_length=hop_length)
-
-        # Create Mask
         mask = create_harmonic_mask(S, f0, sr)
-
-        # Apply Soft Mask (Inverse)
-        # 1 - mask (where mask is 1, we multiply by 0)
-        # Smooth mask? Hard mask is prone to artifacts, but sufficient for subtraction.
         S_clean = S * (1 - mask)
-
-        # Reconstruct
         y_resid = librosa.istft(S_clean, hop_length=hop_length, length=len(y_resid))
 
     return extracted
@@ -109,52 +94,47 @@ def extract_features(
     hop_length = meta.hop_length
 
     # Initialize Detectors
-    # Note: Detectors need to match the SR of the stem provided by Stage A
-    # Stage A output stems have their own .sr property.
-
-    # Results container: Map stem name to list of (f0, conf) tracks
     stem_results: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {}
 
     # 1. Vocals & Bass (SwiftF0)
-    # We use the mono detector
-    # SwiftF0 expects 16kHz usually, Stage A provides 16kHz for these.
-
     for name in ["vocals", "bass"]:
         if name in stems:
             stem = stems[name]
-            # Init detector with stem's SR
             det = SwiftF0Detector(stem.sr, hop_length, fmin=40.0, fmax=2000.0) # Tuned range
             f0, conf = det.predict(stem.audio)
-
-            # Add to results (single track)
             stem_results[name] = [(f0, conf)]
 
-    # 2. Other (SACF + ISS)
+    # 2. Other (SACF + ISS) or Mix in Fast Mode
+    # Apply HPSS to "other" stem (or mono mix if processed as such)
+
+    # Adaptive Params
+    is_lossy = meta.audio_quality == AudioQuality.LOSSY
+    sacf_bandwidth = 16000 if is_lossy else 20000
+
+    target_stems_for_hpss = []
+    if "other" in stems:
+        target_stems_for_hpss.append("other")
+
+    for s_name in target_stems_for_hpss:
+        stem = stems[s_name]
+
+        # HPSS
+        y_harmonic, y_percussive = librosa.effects.hpss(stem.audio)
+        stems[s_name].audio = y_harmonic
+
     if "other" in stems:
         stem = stems["other"]
-        # Init detector
-        # SACF benefits from higher SR (44.1k), which Stage A provides.
         det = SACFDetector(stem.sr, hop_length, fmin=60.0, fmax=2000.0)
-
-        # Run ISS
-        # Max polyphony 4-6
         extracted_tracks = iterative_spectral_subtraction(stem.audio, stem.sr, det, max_polyphony=4)
         stem_results["other"] = extracted_tracks
 
     # 3. Merge into Timeline & Create Stem Timelines
-    # We need to align all tracks to the same time grid.
-
-    # Let's define the target grid based on global meta.
     target_sr = meta.sample_rate
     target_hop = meta.hop_length
-    n_frames_global = int(duration * target_sr / target_hop) + 1
+    n_frames_global = int(meta.duration_sec * target_sr / target_hop) + 1
     times_global = librosa.frames_to_time(np.arange(n_frames_global), sr=target_sr, hop_length=target_hop)
 
     timeline: List[FramePitch] = []
-
-    # Output structure for stem-specific timelines
-    # We map "stem_name" -> List[FramePitch] (where each frame has 1 pitch usually, or multiple for 'other')
-    # Actually, FramePitch is convenient.
     stem_timelines: Dict[str, List[FramePitch]] = {}
 
     # Helper to resample track
@@ -164,8 +144,17 @@ def extract_features(
 
         if n < 2: return np.zeros(n_frames_global), np.zeros(n_frames_global)
 
-        f0_interp = np.interp(times_global, times_src, f0, left=0, right=0)
-        conf_interp = np.interp(times_global, times_src, conf, left=0, right=0)
+        # Use Nearest Neighbor to preserve discrete pitches and avoid artifacts
+        # bounds_error=False, fill_value=0.0
+        f_func = scipy.interpolate.interp1d(times_src, f0, kind='nearest', bounds_error=False, fill_value=0.0)
+        c_func = scipy.interpolate.interp1d(times_src, conf, kind='linear', bounds_error=False, fill_value=0.0)
+
+        f0_interp = f_func(times_global)
+        conf_interp = c_func(times_global)
+
+        # Mask pitch where confidence is low to avoid interpolation artifacts (glissando to 0)
+        f0_interp[conf_interp < 0.5] = 0.0
+
         return f0_interp, conf_interp
 
     # Collect all pitches per frame for the global merged view
@@ -176,12 +165,7 @@ def extract_features(
         stem_sr = stems[name].sr
         stem_hop = hop_length
 
-        # Initialize stem timeline list
         stem_timelines[name] = []
-
-        # To populate stem_timelines[name], we need to combine the tracks for this stem.
-        # For 'vocals'/'bass', usually 1 track. For 'other', multiple tracks.
-        # We need a per-frame list for this stem.
         stem_frame_pitches = [[] for _ in range(n_frames_global)]
 
         for f0, conf in tracks:
@@ -189,15 +173,11 @@ def extract_features(
 
             for i in range(n_frames_global):
                 if f0_res[i] > 10.0:
-                    # Add to global mix
                     frame_pitches_map[i].append((f0_res[i], conf_res[i]))
-                    # Add to stem specific mix
                     stem_frame_pitches[i].append((f0_res[i], conf_res[i]))
 
-        # Create FramePitch objects for this stem
         for i in range(n_frames_global):
             active = stem_frame_pitches[i]
-            # Dominant for this stem
             active.sort(key=lambda x: x[1], reverse=True)
 
             s_pitch = active[0][0] if active else 0.0
@@ -209,13 +189,13 @@ def extract_features(
                 pitch_hz=s_pitch,
                 midi=s_midi,
                 confidence=s_conf,
-                rms=0.0, # RMS not calculated yet
+                rms=0.0,
                 active_pitches=active
             )
             stem_timelines[name].append(fp)
 
-    # Build Global Timeline (Legacy / Merged View)
-    global_rms = np.zeros(n_frames_global) # Placeholder
+    # Build Global Timeline
+    global_rms = np.zeros(n_frames_global)
 
     for i in range(n_frames_global):
         active = frame_pitches_map[i]
@@ -251,13 +231,5 @@ def extract_features(
         else:
             timeline[i].pitch_hz = 0.0
             timeline[i].midi = None
-
-    # Return structure needs to allow passing stem_timelines.
-    # The signature is Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent]].
-    # We can't change signature easily without breaking callers if we don't control them.
-    # But we control `transcription.py`.
-    # However, to avoid changing signature too much, we will update `AnalysisData` in the caller.
-    # For now, return timeline. The caller `transcription.py` needs to change to get `stem_timelines`.
-    # To do that, we should probably change the return type to include stem_timelines.
 
     return timeline, [], [], stem_timelines
