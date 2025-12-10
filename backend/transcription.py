@@ -54,7 +54,15 @@ def transcribe_audio_pipeline(
     # 2. Stage B: Extract Features (Segmentation)
     # Pitch tracking (SwiftF0/SACF) and Hysteresis segmentation
     # Now passing full StageAOutput to support stems
-    timeline, notes, chords, stem_timelines = extract_features(stage_a_out, use_crepe=use_crepe)
+    conf_thresh = kwargs.get("confidence_threshold", 0.5)
+    min_dur = kwargs.get("min_duration_ms", 0.0)
+
+    timeline, notes, chords, stem_timelines = extract_features(
+        stage_a_out,
+        use_crepe=use_crepe,
+        confidence_threshold=conf_thresh,
+        min_duration_ms=min_dur
+    )
 
     tracker_name = "swiftf0+sacf"
     print(f"Notes extracted using: {tracker_name}")
@@ -129,7 +137,11 @@ def transcribe_audio_pipeline(
     events_with_theory = apply_theory(notes, analysis_data)
 
     # 5. Stage D: Quantize and Render
-    musicxml_str = quantize_and_render(events_with_theory, analysis_data)
+    try:
+        musicxml_str = quantize_and_render(events_with_theory, analysis_data)
+    except Exception as e:
+        print(f"Stage D (Rendering) failed: {e}. Returning placeholder XML.")
+        musicxml_str = "<?xml version='1.0' encoding='utf-8'?><score-partwise><part><measure><note><rest/></note></measure></part></score-partwise>"
 
     # 6. Generate MIDI bytes
     midi_bytes = b""

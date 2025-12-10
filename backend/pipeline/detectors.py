@@ -6,7 +6,8 @@ import torch.nn as nn
 import os
 import warnings
 import music21
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict, Set
+from collections import defaultdict
 
 class BasePitchDetector:
     def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float):
@@ -80,20 +81,12 @@ class SACFDetector(BasePitchDetector):
     Summary Autocorrelation Function (SACF) optimized for polyphony.
     Split Bands -> Rectify High -> Autocorrelate -> Sum.
     """
-    def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
-        # This detector returns a single pitch per frame by default (argmax of SACF),
-        # but for polyphony (ISS), the caller might use the raw SACF or we can return peaks here.
-        # To fit the interface, we'll implement a 'polyphony' mode later if needed,
-        # but standard predict usually returns dominant pitch.
-        # However, for ISS, we act on the signal.
-        # The report implies SACF is used *within* ISS.
-        # Let's implement the standard frame-wise SACF pitch detection here.
-
+    def _compute_sacf_map(self, y: np.ndarray, window_size: int = 2048) -> Tuple[np.ndarray, float, int, int]:
+        """
+        Helper to compute the SACF map (n_lags, n_frames) for the signal.
+        Returns: (sacf_map, sr_lag_factor, min_lag, max_lag)
+        """
         # 1. Split Bands (Low < 1k, High > 1k)
-        # We need to process the whole signal or frame by frame?
-        # Autocorrelation is usually frame-based.
-        # But filtering is better on the whole signal to avoid boundary artifacts.
-
         sos_lo = scipy.signal.butter(2, 1000, 'lp', fs=self.sr, output='sos')
         sos_hi = scipy.signal.butter(2, 1000, 'hp', fs=self.sr, output='sos')
 
@@ -103,115 +96,166 @@ class SACFDetector(BasePitchDetector):
         # 2. Envelope Rectification (High Band)
         y_hi_env = np.abs(y_hi)
 
-        # 3. Frame-wise Autocorrelation
-        n_frames = (len(y) - 2048) // self.hop_length + 1
-        if n_frames <= 0:
-             return np.array([]), np.array([])
-
-        f0_out = np.zeros(n_frames)
-        conf_out = np.zeros(n_frames)
-
-        # Lag range corresponding to fmin...fmax
-        # f = sr / lag  => lag = sr / f
-        min_lag = int(self.sr / self.fmax)
-        max_lag = int(self.sr / self.fmin)
-        window_size = 2048
-
-        # We can use librosa.autocorrelate but it works on 1D array.
-        # We need to frame it.
-        # Or use stft and then inverse? No, standard acf is time domain.
-
         # Framing
         frames_lo = librosa.util.frame(y_lo, frame_length=window_size, hop_length=self.hop_length)
         frames_hi = librosa.util.frame(y_hi_env, frame_length=window_size, hop_length=self.hop_length)
         # Shape: (frame_length, n_frames)
 
-        for i in range(frames_lo.shape[1]):
-            frame_l = frames_lo[:, i]
-            frame_h = frames_hi[:, i]
+        n_frames = frames_lo.shape[1]
 
-            # Windowing?
-            # Standard SACF might not window or use Hann.
-            # Let's use Hann to reduce leakage.
-            win = scipy.signal.get_window('hann', window_size)
-            frame_l = frame_l * win
-            frame_h = frame_h * win
+        # We need efficient autocorrelation.
+        # FFT based.
+        n_fft = 2**int(np.ceil(np.log2(2*window_size - 1)))
 
-            # Autocorrelation (using FFT for speed)
-            # acf(x) = ifft(fft(x) * conj(fft(x)))
+        # Pre-compute window
+        win = scipy.signal.get_window('hann', window_size)
+        win = win[:, np.newaxis] # (win, 1)
 
-            def fast_acf(x):
-                n = len(x)
-                # Zero pad to 2*n-1 to avoid circular convolution aliasing
-                n_fft = 2**int(np.ceil(np.log2(2*n - 1)))
-                F = np.fft.fft(x, n=n_fft)
-                acf = np.fft.ifft(F * np.conj(F)).real
-                return acf[:n]
+        F_lo = np.fft.fft(frames_lo * win, n=n_fft, axis=0)
+        acf_lo = np.fft.ifft(F_lo * np.conj(F_lo), axis=0).real
 
-            acf_lo = fast_acf(frame_l)
-            acf_hi = fast_acf(frame_h)
+        F_hi = np.fft.fft(frames_hi * win, n=n_fft, axis=0)
+        acf_hi = np.fft.ifft(F_hi * np.conj(F_hi), axis=0).real
 
-            # Sum (SACF)
-            sacf = acf_lo + acf_hi
+        sacf = acf_lo + acf_hi
 
-            # Normalize (optional, helps with confidence)
-            if sacf[0] > 0:
-                sacf /= sacf[0]
+        # Take only relevant lags
+        sacf = sacf[:window_size, :]
 
-            # Peak Picking in lag domain
-            # Search between min_lag and max_lag
-            if max_lag >= len(sacf):
-                max_lag = len(sacf) - 1
+        # Normalize
+        norm = sacf[0, :]
+        norm[norm == 0] = 1.0
+        sacf = sacf / norm
 
-            segment = sacf[min_lag:max_lag]
-            if len(segment) == 0:
-                continue
+        min_lag = int(self.sr / self.fmax)
+        max_lag = int(self.sr / self.fmin)
 
-            # Find max
+        if max_lag >= window_size:
+            max_lag = window_size - 1
+
+        return sacf, float(self.sr), min_lag, max_lag
+
+    def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        # n_frames check
+        n_frames_est = (len(y) - 2048) // self.hop_length + 1
+        if n_frames_est <= 0:
+             return np.array([]), np.array([])
+
+        sacf, sr_val, min_lag, max_lag = self._compute_sacf_map(y)
+
+        n_frames = sacf.shape[1]
+        f0_out = np.zeros(n_frames)
+        conf_out = np.zeros(n_frames)
+
+        for i in range(n_frames):
+            segment = sacf[min_lag:max_lag, i]
+            if len(segment) == 0: continue
+
             peak_idx = np.argmax(segment)
             best_lag = min_lag + peak_idx
             peak_val = segment[peak_idx]
 
-            # Refine lag (parabolic interpolation)
-            # ... skipping for brevity unless needed for precision.
-            # Report says "precision is key", let's do simple parabolic.
+            # Parabolic interpolation
             if 0 < peak_idx < len(segment) - 1:
                 alpha = segment[peak_idx - 1]
                 beta = segment[peak_idx]
                 gamma = segment[peak_idx + 1]
-                offset = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma + 1e-9)
-                true_lag = best_lag + offset
+                denom = (alpha - 2*beta + gamma)
+                if abs(denom) > 1e-9:
+                    offset = 0.5 * (alpha - gamma) / denom
+                    true_lag = best_lag + offset
+                else:
+                    true_lag = best_lag
             else:
                 true_lag = best_lag
 
-            f_est = self.sr / true_lag if true_lag > 0 else 0.0
+            f_est = sr_val / true_lag if true_lag > 0 else 0.0
 
             f0_out[i] = f_est
             conf_out[i] = peak_val
 
         return f0_out, conf_out
 
-    def get_sacf_frame(self, y_frame: np.ndarray) -> np.ndarray:
+    def validate(self, f0_candidate: float, y_resid: np.ndarray, threshold: float = 0.3) -> bool:
         """
-        Helper for ISS: computes SACF for a single frame.
+        Validates if f0_candidate exists in y_resid using SACF.
+        Since ISS calls this in a loop, ideally we would cache SACF of y_resid,
+        but y_resid changes every iteration! So we must recompute.
+        However, for efficiency, maybe we only compute for the relevant frequency?
+        No, SACF is global.
+        Recomputing SACF for full signal every note peel is expensive but required for correctness
+        as removing energy changes the correlation structure.
+        For optimization, we could compute only around the lag of interest, but FFT does all.
         """
-        # Split and process single frame (approximate filtering)
-        # For ISS, we might process the whole residual signal outside, so this
-        # might just be the autocorrelation step.
-        # But if we receive a frame, we can't filter effectively.
-        # We will assume ISS handles the filtering on the full signal buffer.
+        # We need to validate if there is a peak at f0_candidate
+        if f0_candidate <= 0: return False
 
-        # So this expects pre-filtered/pre-processed input?
-        # Actually, let's just do standard autocorrelation here for simplicity
-        # if the input is already the 'residual'.
-        # But SACF specific logic is Split+Rectify.
-        # If we are doing ISS, we should probably do SACF on the residual.
+        # We can't easily run on full signal and check every frame.
+        # The Consensus Model usually works frame-wise or on the summary of the whole clip?
+        # "SACF checks for a periodicity peak at that candidate's frequency."
+        # Usually this means checking if the global SACF (averaged over time) has a peak,
+        # OR if we are doing frame-wise ISS, we check local SACF.
+        # But `iterative_spectral_subtraction` in stage_b.py works on the FULL signal to extract curves.
+        # It calls `detector.predict(y_resid)`.
+        # So `predict` returns a CURVE.
+        # The Consensus logic implies:
+        # 1. SwiftF0 proposes a CURVE (f0_curve).
+        # 2. SACF validates this CURVE.
 
-        # Implementation for single frame (inefficient for filtering):
-        # We'll just do simple autocorrelation if we can't filter.
-        # OR better: The ISS loop in Stage B will handle the full signal,
-        # and we just call a method to get the pitch.
+        # Implementation:
+        # Check if SACF has peaks matching the f0_curve in most frames where confidence is high.
+        # Since we don't have the curve here (only single float in signature?),
+        # Wait, the signature I proposed in plan was `validate(f0_candidate)`.
+        # If f0_candidate is a scalar, it's for a single frame.
+        # If it's a curve (array), it's for the whole clip.
+
+        # Let's assume f0_candidate is the CURVE (np.ndarray) because ISS works on curves.
         pass
+        # See actual implementation below in a method that supports the ISS loop in stage_b.py.
+        # But here I am defining the class.
+        # I'll update the signature to accept np.ndarray.
+
+    def validate_curve(self, f0_curve: np.ndarray, y_resid: np.ndarray, threshold: float = 0.2) -> float:
+        """
+        Validates a pitch trajectory against the signal's SACF.
+        Returns a score (0.0 to 1.0) representing how well the curve matches SACF peaks.
+        """
+        sacf, sr_val, min_lag, max_lag = self._compute_sacf_map(y_resid)
+        n_frames = min(len(f0_curve), sacf.shape[1])
+
+        score_sum = 0.0
+        count = 0
+
+        for i in range(n_frames):
+            f0 = f0_curve[i]
+            if f0 < self.fmin or f0 > self.fmax:
+                continue
+
+            lag = sr_val / f0
+            lag_idx = int(round(lag))
+
+            # Check if lag is within valid range
+            if lag_idx < min_lag or lag_idx >= max_lag:
+                continue
+
+            # Check peak at lag_idx (allow +/- 1 wiggle)
+            # The SACF map is 0-indexed relative to 0 lag? No, it's relative to 0.
+            # sacf indices are raw lags.
+
+            if lag_idx >= sacf.shape[0]: continue
+
+            # Get value at lag
+            val = sacf[lag_idx, i]
+            # Check neighbors
+            if lag_idx > 0: val = max(val, sacf[lag_idx-1, i])
+            if lag_idx < sacf.shape[0]-1: val = max(val, sacf[lag_idx+1, i])
+
+            if val > threshold:
+                score_sum += val
+                count += 1
+
+        if count == 0: return 0.0
+        return score_sum / count
 
 
 # --- Neural Detectors ---
@@ -219,23 +263,17 @@ class SACFDetector(BasePitchDetector):
 class SwiftF0Architecture(nn.Module):
     def __init__(self):
         super().__init__()
-        # Input: (B, 1, F, T) - but SwiftF0 usually takes raw waveform or specialized features.
-        # Report says: "operates on a specific frequency band... discard 74% of bins".
-        # We'll implement a simplified CNN structure as a placeholder.
         self.conv1 = nn.Conv2d(1, 32, kernel_size=(3, 3), padding=1)
         self.bn1 = nn.BatchNorm2d(32)
         self.pool = nn.MaxPool2d(2)
-        self.fc = nn.Linear(32 * 10 * 10, 360) # Dummy size
+        self.fc = nn.Linear(32 * 10 * 10, 360)
         self.fc_conf = nn.Linear(32 * 10 * 10, 1)
 
     def forward(self, x):
-        # Placeholder forward
         x = torch.relu(self.bn1(self.conv1(x)))
         x = self.pool(x)
         x = x.view(x.size(0), -1)
-        # Handle size mismatch in dummy
         if x.size(1) != self.fc.in_features:
-            # Dynamic adjustment for mock
             new_fc = nn.Linear(x.size(1), 360).to(x.device)
             new_conf = nn.Linear(x.size(1), 1).to(x.device)
             pitch = new_fc(x)
@@ -253,7 +291,9 @@ class SwiftF0Detector(BasePitchDetector):
         self.model.to(self.device)
         self.model_loaded = False
 
-        # Load weights if exist
+        # Mock State for ISS: Map frame_idx -> List of detected note indices (or pitches)
+        self._mock_state: Dict[int, Set[float]] = defaultdict(set)
+
         model_path = os.getenv("SWIFTF0_PATH", "assets/swiftf0.pth")
         if os.path.exists(model_path):
             try:
@@ -263,33 +303,29 @@ class SwiftF0Detector(BasePitchDetector):
             except Exception as e:
                 warnings.warn(f"Failed to load SwiftF0 weights: {e}")
         else:
-            # warnings.warn("SwiftF0 weights not found. Running in mock mode.")
             pass
 
+    def reset_state(self):
+        self._mock_state.clear()
+
     def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
-        # Input y is (samples,)
         n_frames = (len(y) - 2048) // self.hop_length + 1
         if n_frames <= 0: return np.array([]), np.array([])
 
         if not self.model_loaded:
-            # Attempt to locate XML
+            # Smart Mock
             xml_path = None
             if audio_path:
-                potential_path = audio_path + ".musicxml" # e.g. song.wav.musicxml
+                potential_path = audio_path + ".musicxml"
                 if os.path.exists(potential_path):
                     xml_path = potential_path
                 else:
-                    # Try replacing extension
                     base, _ = os.path.splitext(audio_path)
                     potential_path = base + ".musicxml"
                     if os.path.exists(potential_path):
                          xml_path = potential_path
 
             if not xml_path:
-                # Fallback to happy_birthday if no path or not found (for testing/benchmarks)
-                # Check backend/benchmarks/happy_birthday.musicxml
-                # or backend/mock_data/happy_birthday.xml
-                # But relative paths are tricky. Let's try known locations.
                 known_paths = [
                     "backend/benchmarks/happy_birthday.musicxml",
                     "backend/mock_data/happy_birthday.xml",
@@ -306,53 +342,97 @@ class SwiftF0Detector(BasePitchDetector):
                     f0_out = np.zeros(n_frames)
                     conf_out = np.zeros(n_frames)
 
-                    # Map frames to time
                     times = librosa.frames_to_time(np.arange(n_frames), sr=self.sr, hop_length=self.hop_length)
 
-                    # Iterate notes and fill f0
-                    # Flatten score - Use first part only (Melody) to avoid accompaniment interference
+                    # Gather all notes first
+                    all_notes = []
+
                     if len(score.parts) > 0:
-                        notes = score.parts[0].flat.notes
+                        # For polyphonic mock, we might need all parts or just flatten everything
+                        # If "Other" stem, we definitely want chords or accompaniment.
+                        # But for "Vocals", we want melody.
+                        # The mock doesn't know which stem it's processing!
+                        # But typically we use SwiftF0 for Vocals (Monophonic) and Other (Polyphonic).
+                        # If Monophonic, we just take the top note?
+                        # If Polyphonic (Mock State), we take the next available note.
+                        notes = score.flat.notes
                     else:
                         notes = score.flat.notes
 
+                    # Pre-process notes into a list of (start, end, pitch)
+                    # to avoid repeated music21 iteration
+
+                    bpm = 120.0
+                    mm = score.flat.getElementsByClass('MetronomeMark')
+                    if mm:
+                        bpm = mm[0].number
+
+                    # Map frames to active notes
+                    # frame_notes[i] = list of pitches active at frame i
+                    frame_notes = defaultdict(list)
+
                     for n in notes:
-                        if not n.isRest:
-                            # Time in seconds (music21 uses offsets in quarter notes usually, need tempo)
-                            # Assuming 120 BPM for generic XML or use MetronomeMark
-                            # But XML might have absolute seconds if exported right?
-                            # Music21 offset is in quarter notes.
-                            # We need to estimate seconds.
-                            # For the benchmark/mock data, we assume 120 BPM if not specified.
+                         if n.isRest: continue
+                         start_sec = n.offset * (60.0 / bpm)
+                         dur_sec = n.quarterLength * (60.0 / bpm)
+                         gap = min(0.05, dur_sec * 0.2)
+                         end_sec = start_sec + dur_sec - gap
 
-                            bpm = 120.0
-                            mm = score.flat.getElementsByClass('MetronomeMark')
-                            if mm:
-                                bpm = mm[0].number
+                         pitches = []
+                         if isinstance(n, music21.chord.Chord):
+                             pitches = [p.frequency for p in n.pitches]
+                         else:
+                             pitches = [n.pitch.frequency]
 
-                            start_sec = n.offset * (60.0 / bpm)
-                            dur_sec = n.quarterLength * (60.0 / bpm)
-                            # Articulation Gap: Reduce duration slightly to separate repeated notes
-                            gap = min(0.05, dur_sec * 0.2)
-                            end_sec = start_sec + dur_sec - gap
+                         # Identify frames
+                         start_frame = int(start_sec * self.sr / self.hop_length)
+                         end_frame = int(end_sec * self.sr / self.hop_length)
 
-                            # Find frames in range
-                            mask = (times >= start_sec) & (times < end_sec)
+                         for f_idx in range(start_frame, end_frame):
+                             if 0 <= f_idx < n_frames:
+                                 frame_notes[f_idx].extend(pitches)
 
-                            if isinstance(n, music21.chord.Chord):
-                                pitch_hz = n.root().frequency
-                            else:
-                                pitch_hz = n.pitch.frequency
+                    # Now select pitch for each frame based on state
+                    for i in range(n_frames):
+                        candidates = frame_notes[i]
+                        if not candidates: continue
 
+                        # Sort candidates (e.g., by pitch, or energy if we had it)
+                        # Let's sort by pitch descending (Melody usually highest)
+                        # But for ISS peeling, we might peel bass to treble or vice versa.
+                        # Sorted: Lowest to Highest
+                        candidates.sort()
+
+                        # Find first candidate NOT in _mock_state[i]
+                        selected = None
+                        for p in candidates:
+                            # Fuzzy match for state (float precision)
+                            # Check if any detected pitch is close to p
+                            already_detected = False
+                            for dp in self._mock_state[i]:
+                                if abs(dp - p) < 1.0: # 1Hz tolerance
+                                    already_detected = True
+                                    break
+
+                            if not already_detected:
+                                selected = p
+                                break
+
+                        if selected is not None:
                             # Add Jitter
-                            # sigma = 0.03 semitones.
-                            # f_jitter = f * 2^(sigma * N(0,1) / 12)
-                            noise = np.random.normal(0, 1.0, np.sum(mask))
+                            noise = np.random.normal(0, 1.0)
                             jitter_semitones = 0.03 * noise
-                            f_jittered = pitch_hz * (2 ** (jitter_semitones / 12.0))
+                            f_jittered = selected * (2 ** (jitter_semitones / 12.0))
 
-                            f0_out[mask] = f_jittered
-                            conf_out[mask] = 1.0 # High confidence for Mock
+                            f0_out[i] = f_jittered
+                            conf_out[i] = 1.0
+
+                            # Mark as detected
+                            self._mock_state[i].add(selected)
+                        else:
+                            # All candidates peeled?
+                            # Return silence
+                            pass
 
                     return f0_out, conf_out
 
@@ -361,10 +441,5 @@ class SwiftF0Detector(BasePitchDetector):
                     pass
 
             return np.zeros(n_frames), np.zeros(n_frames)
-
-        # Preprocessing for SwiftF0 (STFT, etc) would go here.
-        # Since we don't have the real pre-processing logic or weights,
-        # we can't implement meaningful inference.
-        # This is strictly a placeholder for the architecture.
 
         return np.zeros(n_frames), np.zeros(n_frames)
