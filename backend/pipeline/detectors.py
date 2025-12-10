@@ -15,7 +15,7 @@ class BasePitchDetector:
         self.fmin = fmin
         self.fmax = fmax
 
-    def predict(self, y: np.ndarray) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
+    def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
         """
         Returns (pitch_hz, confidence) per frame.
         Can return lists of lists for polyphony.
@@ -23,7 +23,7 @@ class BasePitchDetector:
         raise NotImplementedError
 
 class YinDetector(BasePitchDetector):
-    def predict(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
         f0, voiced_flag, voiced_probs = librosa.pyin(
             y,
             fmin=self.fmin,
@@ -38,7 +38,7 @@ class YinDetector(BasePitchDetector):
         return f0, voiced_probs
 
 class CQTDetector(BasePitchDetector):
-    def predict(self, y: np.ndarray, polyphony: bool = False, max_peaks: int = 4) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
+    def predict(self, y: np.ndarray, audio_path: Optional[str] = None, polyphony: bool = False, max_peaks: int = 4) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
         bins_per_octave = 36
         C = librosa.cqt(y, sr=self.sr, hop_length=self.hop_length, fmin=self.fmin,
                         n_bins=bins_per_octave * 7, bins_per_octave=bins_per_octave)
@@ -80,7 +80,7 @@ class SACFDetector(BasePitchDetector):
     Summary Autocorrelation Function (SACF) optimized for polyphony.
     Split Bands -> Rectify High -> Autocorrelate -> Sum.
     """
-    def predict(self, y: np.ndarray) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
+    def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[List[List[float]], List[List[float]]]]:
         # This detector returns a single pitch per frame by default (argmax of SACF),
         # but for polyphony (ISS), the caller might use the raw SACF or we can return peaks here.
         # To fit the interface, we'll implement a 'polyphony' mode later if needed,
