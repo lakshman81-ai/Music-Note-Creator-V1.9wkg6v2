@@ -56,7 +56,7 @@ class MetaData:
 class Stem:
     audio: np.ndarray # Monophonic audio array
     sr: int
-    name: str # 'vocals', 'bass', 'other', 'drums', or 'mix'
+    type: str # 'vocals', 'bass', 'other', 'drums', or 'mix'
 
 @dataclass
 class StageAOutput:
