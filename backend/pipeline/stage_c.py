@@ -625,6 +625,8 @@ def apply_theory(
 
     # --- Quantization to beat grid ---
     bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else 120.0
+    if isinstance(bpm, np.ndarray):
+        bpm = float(bpm)
     q_grid = getattr(stage_c_conf, "quantization_grid", {"primary": "1/16"})
     quantize_notes_to_grid(all_notes, bpm, q_grid)
 

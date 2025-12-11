@@ -1,0 +1,150 @@
+{
+  "L1_MONO_SIMPLE": [
+    {
+      "id": "happy_birthday",
+      "errors": [],
+      "stage_a_metrics": {
+        "lf_energy_ratio": 3.733213059839962e-05,
+        "lufs_measured": -22.999999999999996,
+        "lufs_error": 3.552713678800501e-15,
+        "noise_floor_db": -24.299739837646484
+      },
+      "stage_b_metrics": {
+        "RPA": 0.8200168208578638,
+        "RCA": 0.8200168208578638,
+        "VR": 0.9953742640874684,
+        "VFA": 1.0,
+        "OverallAccuracy": 0.8189836203275934
+      },
+      "stage_c_metrics": {
+        "Onset_F1": 0.0,
+        "Onset_Offset_F1": 0.0,
+        "Note_F1": 0.0
+      },
+      "stage_d_metrics": {
+        "SymbolicDistance": 50,
+        "SymbolicDistanceNorm": 1.5151515151515151,
+        "MatchRate": 0.0,
+        "Duration_Diff_Quarters": 8.5
+      }
+    },
+    {
+      "id": "old_macdonald",
+      "errors": [],
+      "stage_a_metrics": {
+        "lf_energy_ratio": 0.00014314939927529143,
+        "lufs_measured": -23.000000000000004,
+        "lufs_error": 3.552713678800501e-15,
+        "noise_floor_db": -23.653173446655273
+      },
+      "stage_b_metrics": {
+        "RPA": 0.5907738095238095,
+        "RCA": 0.5907738095238095,
+        "VR": 0.984375,
+        "VFA": 0.3333333333333333,
+        "OverallAccuracy": 0.5909428359317
+      },
+      "stage_c_metrics": {
+        "Onset_F1": 0.0,
+        "Onset_Offset_F1": 0.0,
+        "Note_F1": 0.0
+      },
+      "stage_d_metrics": {
+        "SymbolicDistance": 47,
+        "SymbolicDistanceNorm": 2.1363636363636362,
+        "MatchRate": 0.0,
+        "Duration_Diff_Quarters": 4.25
+      }
+    }
+  ],
+  "L2_MONO_EXPRESSIVE": [
+    {
+      "id": "happy_birthday_expressive",
+      "errors": [],
+      "stage_a_metrics": {
+        "lf_energy_ratio": 3.671002493575595e-05,
+        "lufs_measured": -22.999999999999996,
+        "lufs_error": 3.552713678800501e-15,
+        "noise_floor_db": -25.007366180419922
+      },
+      "stage_b_metrics": {
+        "RPA": 0.8233809924306139,
+        "RCA": 0.8238015138772078,
+        "VR": 0.9949537426408747,
+        "VFA": 1.0,
+        "OverallAccuracy": 0.8223435531289375
+      },
+      "stage_c_metrics": {
+        "Onset_F1": 0.0,
+        "Onset_Offset_F1": 0.0,
+        "Note_F1": 0.0
+      },
+      "stage_d_metrics": {
+        "SymbolicDistance": 38,
+        "SymbolicDistanceNorm": 1.1515151515151516,
+        "MatchRate": 0.0,
+        "Duration_Diff_Quarters": 8.5
+      }
+    }
+  ],
+  "L3_POLY_DOMINANT": [
+    {
+      "id": "happy_birthday_poly_dominant",
+      "errors": [],
+      "stage_a_metrics": {
+        "lf_energy_ratio": 4.4460012680062415e-05,
+        "lufs_measured": -23.0,
+        "lufs_error": 0.0,
+        "noise_floor_db": -24.33370590209961
+      },
+      "stage_b_metrics": {
+        "RPA": 0.6543313708999159,
+        "RCA": 0.6606391925988225,
+        "VR": 0.9486963835155593,
+        "VFA": 1.0,
+        "OverallAccuracy": 0.6535069298614028
+      },
+      "stage_c_metrics": {
+        "Onset_F1": 0.0,
+        "Onset_Offset_F1": 0.0,
+        "Note_F1": 0.0
+      },
+      "stage_d_metrics": {
+        "SymbolicDistance": 91,
+        "SymbolicDistanceNorm": 1.625,
+        "MatchRate": 0.0,
+        "Duration_Diff_Quarters": 8.75
+      }
+    }
+  ],
+  "L4_POLY_FULL": [
+    {
+      "id": "old_macdonald_poly_full",
+      "errors": [],
+      "stage_a_metrics": {
+        "lf_energy_ratio": 0.00012203170528377584,
+        "lufs_measured": -22.99999999999999,
+        "lufs_error": 1.0658141036401503e-14,
+        "noise_floor_db": -25.154455184936523
+      },
+      "stage_b_metrics": {
+        "RPA": 0.33407738095238093,
+        "RCA": 0.33407738095238093,
+        "VR": 0.8348214285714286,
+        "VFA": 0.6666666666666666,
+        "OverallAccuracy": 0.33407572383073497
+      },
+      "stage_c_metrics": {
+        "Onset_F1": 0.0,
+        "Onset_Offset_F1": 0.0,
+        "Note_F1": 0.0
+      },
+      "stage_d_metrics": {
+        "SymbolicDistance": 63,
+        "SymbolicDistanceNorm": 1.3695652173913044,
+        "MatchRate": 0.0,
+        "Duration_Diff_Quarters": 0.0
+      }
+    }
+  ]
+}
