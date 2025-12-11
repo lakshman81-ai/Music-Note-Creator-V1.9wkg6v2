@@ -63,7 +63,12 @@ class StageAConfig:
 class StageBConfig:
     # Source separation (HTDemucs)
     separation: Dict[str, Any] = field(
-        default_factory=lambda: {"enabled": True, "model": "htdemucs"}
+        default_factory=lambda: {
+            "enabled": True,
+            "model": "htdemucs",
+            "overlap": 0.25,  # Demucs overlap
+            "shifts": 1,      # number of shifts (test-time augmentation)
+        }
     )
 
     # Global voicing threshold for ensemble F0
@@ -127,6 +132,14 @@ class StageBConfig:
 
 @dataclass
 class StageCConfig:
+    # Segmentation method selection + HMM defaults
+    segmentation_method: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "method": "hmm",  # "hmm" | "threshold" | "rms_gate"
+            "states": ["attack", "sustain", "silence"],
+        }
+    )
+
     # Minimum note duration in milliseconds
     # WI: 30 ms for piano/guitar; captures fast grace notes/trills.
     min_note_duration_ms: float = 30.0
@@ -224,8 +237,24 @@ class PipelineConfig:
     instrument_profiles: List[InstrumentProfile] = field(default_factory=list)
 
     def get_profile(self, instrument_name: str) -> Optional[InstrumentProfile]:
+        """
+        Robust instrument profile lookup with simple aliasing.
+        """
+        name = instrument_name.lower()
+
+        # Simple aliases; extend as needed
+        aliases = {
+            "piano": "piano_61key",
+            "keys": "piano_61key",
+            "electric_guitar": "electric_guitar_clean",
+            "electric-guitar": "electric_guitar_clean",
+            "drums": "drums_percussive",
+            "percussion": "drums_percussive",
+        }
+        canonical = aliases.get(name, name)
+
         for p in self.instrument_profiles:
-            if p.instrument == instrument_name:
+            if p.instrument.lower() == canonical:
                 return p
         return None
 
@@ -242,8 +271,8 @@ _profiles: List[InstrumentProfile] = [
         fmin=60.0,
         fmax=2200.0,
         special={
-            # Piano: disable / minimize ensemble smoothing
-            "ensemble_smoothing_frames": 1,
+            # Piano: light ensemble smoothing per WI/master table
+            "ensemble_smoothing_frames": 3,
             "viterbi": False,
         },
     ),
