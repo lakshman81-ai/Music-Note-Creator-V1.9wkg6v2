@@ -623,10 +623,21 @@ def apply_theory(
     # --- Velocity mapping ---
     map_velocity(all_notes, stage_c_conf)
 
-    # --- Quantization to beat grid ---
+    # Quantize (Simple Grid Assignment)
+    # Note: Stage D does more complex XML timing, but we assign grid data here.
     bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else 120.0
-    q_grid = getattr(stage_c_conf, "quantization_grid", {"primary": "1/16"})
-    quantize_notes_to_grid(all_notes, bpm, q_grid)
+
+    # Some upstream code (e.g., librosa beat tracking) can return numpy scalar/array.
+    # Ensure bpm is a plain float to avoid numpy type issues in later math/round().
+    if isinstance(bpm, np.ndarray):
+        bpm = float(bpm)
+
+    quarter_dur = 60.0 / bpm
+
+    # Align to beats if available
+    for n in all_notes:
+        n.duration_beats = (n.end_sec - n.start_sec) / quarter_dur
+
 
     # Store back into analysis_data
     analysis_data.notes = all_notes
