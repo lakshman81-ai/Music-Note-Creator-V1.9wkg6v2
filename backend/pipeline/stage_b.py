@@ -409,5 +409,6 @@ def extract_features(
         f0_main=f0_main_global,
         f0_layers=f0_layers_global,
         per_detector=per_detector_results,
-        stem_timelines=stem_timelines
+        stem_timelines=stem_timelines,
+        meta=meta
     )

@@ -109,9 +109,12 @@ def quantize_and_render(
         # divisions_per_quarter usually handles display, but q_len is float.
         # Round to nearest 0.25
         q_len = round(q_len * 4) / 4.0
-        if q_len == 0: q_len = 0.25 # Minimum
+        if q_len <= 0: q_len = 0.25 # Minimum
 
         velocity = int(np.mean([e.velocity for e in group]) * 127)
+
+        # Force q_len to be a multiple of 0.25 to avoid music21 errors
+        # (It is already rounded, but just ensuring)
 
         if len(group) > 1:
             # Chord
@@ -123,7 +126,14 @@ def quantize_and_render(
             # Note
             m21_obj = music21.note.Note(group[0].midi_note)
 
-        m21_obj.quarterLength = q_len
+        # Force strict duration object
+        # m21_obj.quarterLength = q_len
+        try:
+            m21_obj.duration = music21.duration.Duration(q_len)
+        except Exception:
+            # Fallback to quarter note if duration fails
+            m21_obj.duration = music21.duration.Duration(1.0)
+
         m21_obj.volume.velocity = velocity
 
         # Staccato
@@ -142,12 +152,16 @@ def quantize_and_render(
         if treble_notes:
             obj, start = create_m21_obj(treble_notes)
             # Convert start time to beat offset
-            offset = (start * bpm / 60.0)
+            raw_offset = (start * bpm / 60.0)
+            # Quantize offset to nearest 16th (0.25)
+            offset = round(raw_offset * 4) / 4.0
             part_treble.insert(offset, obj)
 
         if bass_notes:
             obj, start = create_m21_obj(bass_notes)
-            offset = (start * bpm / 60.0)
+            raw_offset = (start * bpm / 60.0)
+            # Quantize offset to nearest 16th (0.25)
+            offset = round(raw_offset * 4) / 4.0
             part_bass.insert(offset, obj)
 
     s.append(part_treble)
@@ -159,6 +173,9 @@ def quantize_and_render(
     # - Tying notes that cross measures
     # - Filling rests? (best effort)
 
+    # Ensure elements are sorted and handle float errors by rounding offsets slightly before measures
+    # Or just rely on makeMeasures.
+
     try:
         s_quant = s.makeMeasures()
         # makeTies logic is implicitly handled if we inserted duration > measure_len?
@@ -167,7 +184,10 @@ def quantize_and_render(
         s_quant.makeTies(inPlace=True)
     except Exception as e:
         print(f"Quantization failed: {e}")
-        s_quant = s # Fallback
+        # If makeMeasures fails, we might have weird durations.
+        # Fallback to just returning the raw score if possible,
+        # but musicXML export might still fail if durations are bad (e.g. infinite).
+        s_quant = s
 
     # 4. Export
     from music21.musicxml import m21ToXml
