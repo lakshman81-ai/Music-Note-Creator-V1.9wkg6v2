@@ -11,42 +11,55 @@ PitchName = Literal[
     "F#", "G", "G#", "A", "A#", "B"
 ]
 
+
 class AudioType(str, Enum):
     MONOPHONIC = "monophonic"
     POLYPHONIC_DOMINANT = "polyphonic_dominant"
     POLYPHONIC = "polyphonic"
 
+
 class AudioQuality(str, Enum):
     LOSSLESS = "lossless"  # WAV, FLAC, AIFF
     LOSSY = "lossy"        # MP3, M4A, OGG
+
 
 # ---------- Meta / global info ----------
 
 @dataclass
 class MetaData:
-    tuning_offset: float = 0.0          # in semitones (fractional)
-    detected_key: str = "C"            # e.g. "C", "Gm"
-    lufs: float = -14.0                # integrated loudness in LUFS
-    processing_mode: str = "mono"      # "mono" | "stereo" | "polyphonic"
-    audio_type: AudioType = AudioType.MONOPHONIC # detected audio type
-    audio_quality: AudioQuality = AudioQuality.LOSSLESS # detected audio quality
-    snr: float = 0.0                   # signal-to-noise estimate
-    window_size: int = 2048            # analysis window size
-    hop_length: int = 512              # analysis hop length
-    sample_rate: int = 22050           # analysis sample rate (corresponds to target_sr)
-    tempo_bpm: Optional[float] = 120.0 # global tempo estimate
-    time_signature: str = "4/4"        # default, can be improved later
+    # Tuning / music-theory info
+    tuning_offset: float = 0.0              # in semitones (fractional)
+    detected_key: str = "C"                 # e.g. "C", "Gm"
 
-    # New fields
+    # Loudness / processing
+    lufs: float = -14.0                     # integrated loudness in LUFS
+    processing_mode: str = "mono"           # "mono" | "stereo" | "polyphonic"
+    audio_type: AudioType = AudioType.MONOPHONIC
+    audio_quality: AudioQuality = AudioQuality.LOSSLESS
+    snr: float = 0.0                        # signal-to-noise estimate
+
+    # Time–frequency analysis parameters
+    window_size: int = 2048                 # analysis window size
+    hop_length: int = 512                   # analysis hop length
+    sample_rate: int = 44100                # effective working SR
+    tempo_bpm: Optional[float] = 120.0      # global tempo estimate
+    time_signature: str = "4/4"             # default, can be refined
+
+    # Original IO info
     original_sr: Optional[int] = None
-    target_sr: int = 22050
+    target_sr: int = 44100
     duration_sec: float = 0.0
+
+    # Optional beat grid (seconds)
+    beats: List[float] = field(default_factory=list)
 
     # Extended robust fields
     audio_path: Optional[str] = None
     n_channels: int = 1
     normalization_gain_db: float = 0.0
-    rms_db: float = -float('inf')
+    rms_db: float = -float("inf")
+    noise_floor_rms: float = 0.0            # from Stage A percentile RMS
+    noise_floor_db: float = -80.0           # log version of noise_floor_rms
     pipeline_version: str = "2.0.0"
 
 
@@ -54,39 +67,48 @@ class MetaData:
 
 @dataclass
 class Stem:
-    audio: np.ndarray # Monophonic audio array
+    audio: np.ndarray   # Monophonic (or summed) audio array
     sr: int
-    type: str # 'vocals', 'bass', 'other', 'drums', or 'mix'
+    type: str           # 'vocals', 'bass', 'other', 'drums', or 'mix'
+
 
 @dataclass
 class StageAOutput:
-    stems: Dict[str, Stem] # keys: 'vocals', 'bass', 'other', 'drums', etc.
+    stems: Dict[str, Stem]                  # keys: 'vocals', 'bass', 'other', 'drums', 'mix', etc.
     meta: MetaData
     audio_type: AudioType
+
+    # Extra Stage A diagnostics / helpers
+    noise_floor_rms: float = 0.0
+    noise_floor_db: float = -80.0
+    beats: List[float] = field(default_factory=list)
 
 
 # ---------- Stage B Output Structures ----------
 
 @dataclass
 class StageBOutput:
-    time_grid: np.ndarray              # Array of time stamps
-    f0_main: np.ndarray                # Main pitch track (or skyline)
-    f0_layers: List[np.ndarray]        # Polyphonic layers
-    per_detector: Dict[str, Any]       # Raw outputs from each detector: "swiftf0": (f0, conf), ...
-    stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict) # Processed timelines
-    meta: Optional[MetaData] = None    # Passed through from Stage A
+    time_grid: np.ndarray                   # Array of time stamps
+    f0_main: np.ndarray                     # Main pitch track (or skyline)
+    f0_layers: List[np.ndarray]             # Polyphonic layers
+    # per_detector[stem_name][det_name] = (f0_array, conf_array)
+    per_detector: Dict[str, Any]
+    stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict)
+    meta: Optional[MetaData] = None         # Passed through from Stage A
 
 
 # ---------- Pitch timeline ----------
 
 @dataclass
 class FramePitch:
-    time: float                        # seconds
-    pitch_hz: float                    # 0.0 if unvoiced
-    midi: Optional[int]                # None if unvoiced
-    confidence: float                  # 0–1
-    rms: float = 0.0                   # Frame RMS energy
-    active_pitches: List[Tuple[float, float]] = field(default_factory=list) # List of (pitch_hz, confidence)
+    time: float                             # seconds
+    pitch_hz: float                         # 0.0 if unvoiced
+    midi: Optional[int]                     # None if unvoiced
+    confidence: float                       # 0–1
+    rms: float = 0.0                        # Frame RMS energy (linear)
+    active_pitches: List[Tuple[float, float]] = field(
+        default_factory=list
+    )  # List of (pitch_hz, confidence)
 
 
 # ---------- Note events ----------
@@ -109,32 +131,32 @@ class NoteEvent:
     confidence: float = 0.0
 
     # Performance-ish info
-    velocity: float = 0.8              # 0–1 (later mapped to MIDI 0–127)
-    rms_value: float = 0.0             # Raw RMS energy (linear)
+    velocity: float = 0.8                   # 0–1 (later mapped to MIDI 0–127)
+    rms_value: float = 0.0                  # Raw RMS energy (linear)
     is_grace: bool = False
-    dynamic: str = "mf"                # "p", "mf", "f", etc.
-    voice: int = 1                     # Voice index
-    staff: str = "treble"              # "treble" or "bass"
+    dynamic: str = "mf"                     # "p", "mf", "f", etc.
+    voice: int = 1                          # Voice index
+    staff: str = "treble"                   # "treble" or "bass"
 
     # Musical grid (filled after quantization)
     measure: Optional[int] = None
-    beat: Optional[float] = None       # beat in measure (1.0, 1.5, etc.)
+    beat: Optional[float] = None            # beat in measure (1.0, 1.5, etc.)
     duration_beats: Optional[float] = None
 
     # Extra info
     alternatives: List[AlternativePitch] = field(default_factory=list)
-    spec_thumb: Optional[str] = None   # optional spectrogram thumbnail id
+    spec_thumb: Optional[str] = None        # optional spectrogram thumbnail id
 
 
 # ---------- Chords & layout ----------
 
 @dataclass
 class ChordEvent:
-    time: float                        # seconds
-    beat: float                        # global beat index
-    symbol: str                        # e.g. "C", "G7", "Am"
+    time: float                             # seconds
+    beat: float                             # global beat index
+    symbol: str                             # e.g. "C", "G7", "Am"
     root: str = "C"
-    quality: str = "M"                 # "M", "m", "7", etc.
+    quality: str = "M"                      # "M", "m", "7", etc.
 
 
 @dataclass
@@ -142,7 +164,7 @@ class VexflowLayout:
     measures: List[Dict[str, Any]] = field(default_factory=list)
 
 
-# ---------- All analysis data ----------
+# ---------- Benchmark & full analysis ----------
 
 @dataclass
 class BenchmarkResult:
@@ -159,15 +181,15 @@ class AnalysisData:
     chords: List[ChordEvent] = field(default_factory=list)
     vexflow_layout: VexflowLayout = field(default_factory=VexflowLayout)
 
-    # New fields
+    # Newer fields (multi-stem + note pipeline)
     notes: List[NoteEvent] = field(default_factory=list)
     stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict)
     stem_onsets: Dict[str, List[float]] = field(default_factory=dict)
     onsets: List[float] = field(default_factory=list)
-    beats: List[float] = field(default_factory=list) # Beat timestamps
+    beats: List[float] = field(default_factory=list)  # Beat timestamps (seconds)
 
     # Extended robust fields
-    pitch_tracker: str = "pyin"  # "pyin" | "crepe"
+    pitch_tracker: str = "pyin"           # "pyin" | "crepe" | "swiftf0" etc.
     n_frames: int = 0
     frame_hop_seconds: float = 0.0
     notes_before_quantization: List[NoteEvent] = field(default_factory=list)
@@ -177,7 +199,6 @@ class AnalysisData:
         """
         JSON-serializable representation for debugging / API.
         """
-        # Ensure 'notes' field is populated if empty but 'events' is not
         notes_to_use = self.notes if self.notes else self.events
 
         return {
