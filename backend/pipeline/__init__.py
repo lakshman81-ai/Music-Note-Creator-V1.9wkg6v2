@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Optional
+
 from .config import PIANO_61KEY_CONFIG, PipelineConfig
 from .stage_a import load_and_preprocess
 from .stage_b import extract_features
@@ -16,18 +17,44 @@ from .models import (
     NoteEvent,
 )
 
+__all__ = [
+    "PIANO_61KEY_CONFIG",
+    "PipelineConfig",
+    "load_and_preprocess",
+    "extract_features",
+    "apply_theory",
+    "quantize_and_render",
+    "AnalysisData",
+    "TranscriptionResult",
+    "StageAOutput",
+    "StageBOutput",
+    "NoteEvent",
+    "transcribe",
+]
+
 
 def transcribe(
     audio_path: str,
-    config: PipelineConfig = PIANO_61KEY_CONFIG,
+    config: Optional[PipelineConfig] = None,
 ) -> TranscriptionResult:
     """
     High-level orchestration:
         Stage A → Stage B → Stage C → Stage D
 
-    Returns:
+    Parameters
+    ----------
+    audio_path : str
+        Path to the input audio file (e.g. WAV/MP3).
+    config : PipelineConfig, optional
+        Full pipeline configuration. If None, uses PIANO_61KEY_CONFIG.
+
+    Returns
+    -------
+    TranscriptionResult
         TranscriptionResult(musicxml, analysis_data, midi_bytes)
     """
+    if config is None:
+        config = PIANO_61KEY_CONFIG
 
     # -----------------------------
     # Stage A — Load & Preprocess
@@ -94,4 +121,3 @@ def transcribe(
         analysis_data=analysis,
         midi_bytes=midi_bytes,
     )
-
