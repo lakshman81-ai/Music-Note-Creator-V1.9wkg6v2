@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Dict
+from typing import Dict, Any
 
 import numpy as np
 import librosa
@@ -43,18 +43,33 @@ def detect_audio_type(y: np.ndarray, sr: int) -> AudioType:
 # Helper: Demucs (used by Stage B, not called here)
 # ------------------------------------------------------------
 
-def apply_demucs(audio: np.ndarray, sr: int, model_name: str = "htdemucs") -> Dict[str, np.ndarray]:
+def apply_demucs(
+    audio: np.ndarray,
+    sr: int,
+    model_name: str = "htdemucs",
+    separation_conf: Dict[str, Any] | None = None,
+) -> Dict[str, np.ndarray]:
     """
     Apply Hybrid Demucs.
     Returns dict of mono stems: {'vocals', 'bass', 'drums', 'other'}.
-    NOTE: This is invoked from Stage B (separation), not Stage A.
+
+    NOTE:
+    - This is invoked from Stage B (separation), not Stage A.
+    - Behavior can be tuned via separation_conf, e.g.:
+        {
+            "overlap": 0.25,
+            "shifts": 1,
+        }
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
         model = pretrained.get_model(model_name)
         model.to(device)
     except Exception as e:
-        warnings.warn(f"Failed to load Demucs model: {e}. Returning original mix as stems.")
+        warnings.warn(
+            f"Failed to load Demucs model '{model_name}': {e}. "
+            f"Returning original mix as all stems."
+        )
         return {"vocals": audio, "bass": audio, "drums": audio, "other": audio}
 
     # Ensure stereo [2, T]
@@ -62,12 +77,14 @@ def apply_demucs(audio: np.ndarray, sr: int, model_name: str = "htdemucs") -> Di
         audio_stereo = np.stack([audio, audio])
     elif audio.ndim == 2:
         if audio.shape[0] > 2:
+            # assume [T, C], transpose
             audio_stereo = audio.T
         else:
             audio_stereo = audio
     else:
-        audio_stereo = np.mean(audio, axis=-1)
-        audio_stereo = np.stack([audio_stereo, audio_stereo])
+        # Fallback: collapse last axis and duplicate
+        collapsed = np.mean(audio, axis=-1)
+        audio_stereo = np.stack([collapsed, collapsed])
 
     model_sr = model.samplerate
     if sr != model_sr:
@@ -78,11 +95,25 @@ def apply_demucs(audio: np.ndarray, sr: int, model_name: str = "htdemucs") -> Di
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
 
+    # Read knobs from separation_conf if provided
+    overlap = 0.25
+    shifts = 1
+    if separation_conf is not None:
+        overlap = float(separation_conf.get("overlap", overlap))
+        shifts = int(separation_conf.get("shifts", shifts))
+
     with torch.no_grad():
-        sources = apply_model(model, wav[None], shifts=1, split=True, overlap=0.25, progress=False)[0]
+        sources = apply_model(
+            model,
+            wav[None],
+            shifts=shifts,
+            split=True,
+            overlap=overlap,
+            progress=False,
+        )[0]
 
     sources = sources * ref.std() + ref.mean()
-    stems = {}
+    stems: Dict[str, np.ndarray] = {}
     source_names = model.sources
     for i, name in enumerate(source_names):
         stem_audio = sources[i].cpu().numpy()
@@ -111,10 +142,10 @@ def load_and_preprocess(
     4. Transient pre-emphasis (hammer clicks)
     5. High-pass filter at ~55 Hz
     6. Silence trimming at top_db=50
-    7. EBU R128 loudness normalization to -23 LUFS
+    7. EBU R128 loudness normalization to target LUFS (skipped in fast_mode)
     8. Optional peak limiter (soft/hard to ceiling)
     9. Noise floor estimation (percentile of RMS)
-    10. BPM / beat grid detection
+    10. BPM / beat grid detection (skipped in fast_mode)
     11. Classify audio type + quality
     12. Return StageAOutput with a single 'mix' stem; separation is handled in Stage B.
     """
@@ -131,6 +162,7 @@ def load_and_preprocess(
     except Exception:
         y, orig_sr = sf.read(audio_path)
         if y.ndim == 2:
+            # soundfile returns [T, C]
             y = y.T
 
     if orig_sr != target_sr:
@@ -187,23 +219,36 @@ def load_and_preprocess(
         y_trimmed = y
 
     # -----------------------------
-    # 7. Loudness Normalization
+    # 7. Loudness Normalization (EBU R128)
     # -----------------------------
     norm_gain = 0.0
     y_norm = y_trimmed
+    measured_lufs = None
 
-    if config.loudness_normalization.get("enabled", True):
+    if (not fast_mode) and config.loudness_normalization.get("enabled", True):
         target_lufs = float(config.loudness_normalization.get("target_lufs", -23.0))
         meter = pyln.Meter(sr)
         try:
+            # Avoid extremely short segments; R128 needs some duration
             if len(y_trimmed) / sr >= 0.4:
                 loudness = meter.integrated_loudness(y_trimmed)
+                measured_lufs = float(loudness)
                 if not (np.isneginf(loudness) or loudness < -70.0):
                     y_norm = pyln.normalize.loudness(y_trimmed, loudness, target_lufs)
                     norm_gain = target_lufs - loudness
+                else:
+                    # Too quiet or invalid, skip normalization
+                    y_norm = y_trimmed
+            else:
+                # Too short for reliable measurement
+                y_norm = y_trimmed
         except Exception as e:
-            warnings.warn(f"Loudness norm failed: {e}")
+            warnings.warn(f"Loudness normalization failed: {e}")
             y_norm = y_trimmed
+    else:
+        # fast_mode or normalization disabled
+        y_norm = y_trimmed
+        norm_gain = 0.0
 
     # -----------------------------
     # 7b. Peak Limiter (optional)
@@ -232,6 +277,7 @@ def load_and_preprocess(
         noise_floor_rms = float(np.percentile(rms, percentile))
         noise_floor_db = 20.0 * np.log10(noise_floor_rms + 1e-9)
     else:
+        # Very short audio; default to -80 dB floor
         noise_floor_rms = 0.0
         noise_floor_db = -80.0
 
@@ -239,8 +285,8 @@ def load_and_preprocess(
     # 9. BPM / Beat Grid
     # -----------------------------
     bpm = None
-    beats = []
-    if config.bpm_detection.get("enabled", True):
+    beats: np.ndarray | list[float] = []
+    if (not fast_mode) and config.bpm_detection.get("enabled", True):
         try:
             bpm_val, beat_frames = librosa.beat.beat_track(y=y_norm, sr=sr)
             bpm = float(bpm_val)
@@ -248,6 +294,9 @@ def load_and_preprocess(
         except Exception:
             bpm = None
             beats = []
+    else:
+        bpm = None
+        beats = []
 
     # -----------------------------
     # 10. Classification & Quality
@@ -255,6 +304,9 @@ def load_and_preprocess(
     audio_type = detect_audio_type(y_norm, sr)
     ext = os.path.splitext(audio_path)[1].lower()
     quality = AudioQuality.LOSSY if ext in [".mp3", ".ogg", ".m4a"] else AudioQuality.LOSSLESS
+
+    # processing_mode: mono vs stereo (based on original channels)
+    processing_mode = "mono" if n_channels <= 1 else "stereo"
 
     # -----------------------------
     # 11. Build Stems (Stage A)
@@ -276,16 +328,27 @@ def load_and_preprocess(
     # Default tempo if detection failed
     tempo_bpm = float(bpm) if bpm is not None else 120.0
 
+    # Decide what to store in MetaData.lufs:
+    # - measured_lufs if available
+    # - otherwise, the target LUFS (if normalization enabled)
+    # - otherwise, a generic default (-23.0)
+    if measured_lufs is not None:
+        meta_lufs = measured_lufs
+    elif config.loudness_normalization.get("enabled", True):
+        meta_lufs = float(config.loudness_normalization.get("target_lufs", -23.0))
+    else:
+        meta_lufs = -23.0
+
     meta = MetaData(
         tuning_offset=0.0,
         detected_key="C",  # can be updated later by key detection
-        lufs=float(config.loudness_normalization.get("target_lufs", -23.0)),
-        processing_mode=audio_type.value,
+        lufs=meta_lufs,
+        processing_mode=processing_mode,
         audio_type=audio_type,
         audio_quality=quality,
-        snr=0.0,  # placeholder if you later compute SNR
+        snr=0.0,  # TODO: compute SNR from signal vs noise_floor_rms
         window_size=2048,
-        hop_length=512,  # global analysis hop (Stage B uses meta.hop_length)
+        hop_length=512,  # global analysis hop (Stage B can use meta.hop_length)
         sample_rate=sr,
         tempo_bpm=tempo_bpm,
         time_signature="4/4",
@@ -317,4 +380,3 @@ def load_and_preprocess(
         noise_floor_db=noise_floor_db,
         beats=[float(b) for b in beats],
     )
-
