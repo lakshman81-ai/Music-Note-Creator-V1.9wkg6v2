@@ -41,6 +41,11 @@ class StageAConfig:
         default_factory=lambda: {"enabled": True, "target_lufs": -23.0}
     )
 
+    # Peak limiter (Soft clip or -1 dB ceiling)
+    peak_limiter: Dict[str, Any] = field(
+        default_factory=lambda: {"enabled": False, "mode": "ceiling_db", "ceiling_db": -1.0}
+    )
+
     # Noise floor estimation (percentile of RMS)
     noise_floor_estimation: Dict[str, Any] = field(
         default_factory=lambda: {"percentile": 30}
