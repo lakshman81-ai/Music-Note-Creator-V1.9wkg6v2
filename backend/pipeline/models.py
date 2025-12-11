@@ -74,6 +74,7 @@ class StageBOutput:
     f0_layers: List[np.ndarray]        # Polyphonic layers
     per_detector: Dict[str, Any]       # Raw outputs from each detector: "swiftf0": (f0, conf), ...
     stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict) # Processed timelines
+    meta: Optional[MetaData] = None    # Passed through from Stage A
 
 
 # ---------- Pitch timeline ----------
