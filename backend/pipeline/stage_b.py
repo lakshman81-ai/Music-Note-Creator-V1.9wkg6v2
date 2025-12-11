@@ -169,11 +169,12 @@ def extract_features(
     final_stems: Dict[str, Stem] = {}
 
     if sb_config.separation.get("enabled", True) and mix_stem is not None:
-        # Run Demucs on the conditioned mix
+        # Run Demucs on the conditioned mix, using config knobs
         demucs_stems = apply_demucs(
             mix_stem.audio,
             mix_stem.sr,
             model_name=sb_config.separation.get("model", "htdemucs"),
+            separation_conf=sb_config.separation,
         )
 
         # Map Demucs outputs to Stem objects
@@ -268,7 +269,6 @@ def extract_features(
         # 4.0 Precompute per-frame RMS for this stem
         # ----------------------------------------------------
         # This feeds into Stage C via FramePitch.rms → NoteEvent.rms_value
-        # and then velocity mapping (min_db / max_db).
         frame_rms = librosa.feature.rms(
             y=audio,
             frame_length=2048,
@@ -292,8 +292,6 @@ def extract_features(
                 d = cls(
                     sr=global_sr,
                     hop_length=global_hop,
-                    fmin=profile.fmin,
-                    fmax=profile.fmax,
                     **kwargs,
                 )
                 detectors.append((name, d))
@@ -304,19 +302,39 @@ def extract_features(
 
         # SwiftF0
         if dconf.get("swiftf0", {}).get("enabled", False):
-            add_det(SwiftF0Detector, "swiftf0")
+            add_det(
+                SwiftF0Detector,
+                "swiftf0",
+                fmin=profile.fmin,
+                fmax=profile.fmax,
+            )
 
         # YIN
         if dconf.get("yin", {}).get("enabled", False):
-            add_det(YinDetector, "yin")
+            add_det(
+                YinDetector,
+                "yin",
+                fmin=profile.fmin,
+                fmax=profile.fmax,
+            )
 
         # SACF
         if dconf.get("sacf", {}).get("enabled", False):
-            add_det(SACFDetector, "sacf")
+            add_det(
+                SACFDetector,
+                "sacf",
+                fmin=profile.fmin,
+                fmax=profile.fmax,
+            )
 
         # CQT
         if dconf.get("cqt", {}).get("enabled", False):
-            add_det(CQTDetector, "cqt")
+            add_det(
+                CQTDetector,
+                "cqt",
+                fmin=profile.fmin,
+                fmax=profile.fmax,
+            )
 
         # RMVPE (if recommended or globally enabled)
         if profile.recommended_algo == "rmvpe" or dconf.get("rmvpe", {}).get("enabled", False):
@@ -324,7 +342,15 @@ def extract_features(
             sil_thresh = profile.special.get(
                 "silence_threshold", rm_conf.get("silence_threshold", 0.04)
             )
-            add_det(RMVPEDetector, "rmvpe", silence_threshold=sil_thresh)
+            fmin_rm = rm_conf.get("fmin", profile.fmin)
+            fmax_rm = rm_conf.get("fmax", profile.fmax)
+            add_det(
+                RMVPEDetector,
+                "rmvpe",
+                silence_threshold=sil_thresh,
+                fmin=fmin_rm,
+                fmax=fmax_rm,
+            )
 
         # CREPE (if recommended or globally enabled)
         if profile.recommended_algo == "crepe" or dconf.get("crepe", {}).get("enabled", False):
@@ -333,11 +359,15 @@ def extract_features(
                 "viterbi", cr_conf.get("use_viterbi", False)
             )
             model_capacity = cr_conf.get("model_capacity", "full")
+            fmin_cr = cr_conf.get("fmin", profile.fmin)
+            fmax_cr = cr_conf.get("fmax", profile.fmax)
             add_det(
                 CREPEDetector,
                 "crepe",
                 model_capacity=model_capacity,
                 use_viterbi=viterbi,
+                fmin=fmin_cr,
+                fmax=fmax_cr,
             )
 
         # If no detectors, skip stem
@@ -414,11 +444,17 @@ def extract_features(
                     if diff_cents > disagreement_cents:
                         disagreement = True
 
+            # WI: If detectors strongly disagree, treat frame as unvoiced
+            if disagreement:
+                stem_f0[i] = 0.0
+                stem_conf[i] = 0.0
+                continue
+
             final_f0 = 0.0
             final_conf = 0.0
 
-            # Priority override (SwiftF0 dominates if confident and no big disagreement)
-            if swift and swift["conf"] >= priority_floor and not disagreement:
+            # Priority override (SwiftF0 dominates if confident)
+            if swift and swift["conf"] >= priority_floor:
                 final_f0 = swift["f0"]
                 final_conf = swift["conf"]
             else:
@@ -506,7 +542,8 @@ def extract_features(
 
             for layer_f0 in stem_layers:
                 if layer_f0[i] > 0.0:
-                    # Use a nominal confidence for layers (since we don't track per-layer conf)
+                    # ISS layers currently lack per-layer confidence;
+                    # we assign a nominal 0.8 for downstream processing.
                     active.append((float(layer_f0[i]), 0.8))
 
             active.sort(key=lambda x: x[1], reverse=True)
