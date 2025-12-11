@@ -1,48 +1,38 @@
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
 import librosa
 import scipy.signal
 import scipy.interpolate
-from .models import MetaData, FramePitch, NoteEvent, ChordEvent, StageAOutput, Stem, AudioQuality
-from .detectors import YinDetector, CQTDetector, SACFDetector, SwiftF0Detector
+from .models import MetaData, FramePitch, NoteEvent, ChordEvent, StageAOutput, Stem, AudioQuality, StageBOutput
+from .detectors import YinDetector, CQTDetector, SACFDetector, SwiftF0Detector, RMVPEDetector, CREPEDetector
+from .config import PIANO_61KEY_CONFIG, StageBConfig, InstrumentProfile, PipelineConfig
 
 def midi_to_hz(midi: float) -> float:
     return 440.0 * (2.0 ** ((midi - 69.0) / 12.0))
 
 def hz_to_midi(hz: float) -> float:
-    if hz <= 0:
-        return 0.0
+    if hz <= 0: return 0.0
     return 69.0 + 12.0 * np.log2(hz / 440.0)
 
 def create_harmonic_mask(stft: np.ndarray, f0_curve: np.ndarray, sr: int, width: float = 0.03) -> np.ndarray:
-    """
-    Creates a spectral mask to suppress harmonics of the given pitch trajectory.
-    width: Fractional bandwidth to mask around harmonics (default 3%).
-    """
     n_freqs, n_frames = stft.shape
     fft_freqs = librosa.fft_frequencies(sr=sr, n_fft=(n_freqs - 1) * 2)
     mask = np.zeros_like(stft, dtype=np.float32)
 
     for t in range(min(n_frames, len(f0_curve))):
         f0 = f0_curve[t]
-        if f0 <= 0:
-            continue
+        if f0 <= 0: continue
 
-        # Identify harmonics up to Nyquist
         harmonics = np.arange(1, 20) * f0
         harmonics = harmonics[harmonics < sr / 2]
 
         for h_freq in harmonics:
-            # Bandwidth
             bw = h_freq * width
             f_low = h_freq - bw/2
             f_high = h_freq + bw/2
 
-            # Find bins
             idx_start = np.searchsorted(fft_freqs, f_low)
             idx_end = np.searchsorted(fft_freqs, f_high)
-
-            # Apply mask (1.0 means fully masked/removed later)
             mask[idx_start:idx_end, t] = 1.0
 
     return mask
@@ -53,57 +43,33 @@ def iterative_spectral_subtraction(
     primary_detector,
     validator_detector,
     max_polyphony: int = 4,
-    termination_conf: float = 0.15,
+    mask_width: float = 0.03,
     audio_path: Optional[str] = None
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Performs ISS to extract multiple pitch trajectories using Consensus Model.
-    SwiftF0 (primary) proposes, SACF (validator) confirms.
-    Returns list of (f0_curve, conf_curve).
-    """
+
     extracted = []
     y_resid = audio.copy()
-
     n_fft = 2048
     hop_length = primary_detector.hop_length
 
     for i in range(max_polyphony):
-        # 1. Proposal (SwiftF0)
+        # 1. Proposal
         f0, conf = primary_detector.predict(y_resid, audio_path=audio_path)
 
-        if np.mean(conf) < termination_conf and np.max(conf) < termination_conf * 1.5:
+        # Check termination
+        if np.mean(conf) < 0.15 and np.max(conf) < 0.25:
             break
 
-        # 2. Validation (SACF)
-        # Check if the proposed curve has support in the signal's autocorrelation
-        # "Consensus Threshold: Lower to 0.3 for secondary notes in a chord."
-        # Use 0.3 as default for secondary notes (i > 0), maybe higher for first?
-        # But let's stick to a robust default.
+        # 2. Validation
         validation_score = validator_detector.validate_curve(f0, y_resid, threshold=0.2)
-
-        # If validation fails, we might still accept if confidence is very high?
-        # Or strictly reject. "Consensus Model" implies strict agreement.
-        # But for Mock, SACF might not work well if signal is synthetic?
-        # Mock SwiftF0 returns perfect Ground Truth.
-        # Synthetic audio has correct pitch. SACF should work.
-        # If validation fails (score < 0.2), we skip or stop?
-        # If we skip, we might find another note? But predict() is deterministic for SwiftF0 Mock
-        # unless we tell it to find "next best".
-        # But SwiftF0 Mock returns "loudest/lowest remaining".
-        # So if we reject it, we are stuck?
-        # Actually, if we reject, we probably shouldn't peel it.
-        # But if we don't peel, SwiftF0 will propose it again!
-        # So we must break or accept.
-
-        if validation_score < 0.2 and i > 0: # Allow first note to pass easier?
-             # print(f"ISS: Note {i} rejected by SACF (Score: {validation_score:.2f})")
-             break
+        if validation_score < 0.2 and i > 0:
+            break
 
         extracted.append((f0, conf))
 
-        # 3. Spectral Subtraction
+        # 3. Subtraction
         S = librosa.stft(y_resid, n_fft=n_fft, hop_length=hop_length)
-        mask = create_harmonic_mask(S, f0, sr)
+        mask = create_harmonic_mask(S, f0, sr, width=mask_width)
         S_clean = S * (1 - mask)
         y_resid = librosa.istft(S_clean, hop_length=hop_length, length=len(y_resid))
 
@@ -111,185 +77,337 @@ def iterative_spectral_subtraction(
 
 def extract_features(
     stage_a_output: StageAOutput,
-    use_crepe: bool = False, # Deprecated/Ignored
-    confidence_threshold: float = 0.5,
-    min_duration_ms: float = 0.0,
-) -> Tuple[List[FramePitch], List[NoteEvent], List[ChordEvent], Dict[str, List[FramePitch]]]:
-    """
-    Stage B: Adaptive Pitch Detection (Stem-based).
-    """
+    config: PipelineConfig = PIANO_61KEY_CONFIG,
+    use_crepe: bool = False, # Deprecated
+    confidence_threshold: float = 0.5, # Deprecated in favor of config
+    min_duration_ms: float = 0.0, # Deprecated
+) -> StageBOutput:
+
+    sb_config = config.stage_b
     meta = stage_a_output.meta
+
+    # 1. Separation (if enabled and not mono/fast mode)
+    # The Separation Logic from WI 2.2.1
     stems = stage_a_output.stems
-    sr = meta.sample_rate # Target SR
-    hop_length = meta.hop_length
+    mix_stem = stems.get("mix", stems.get("vocals", None)) # Fallback
 
-    # Initialize Detectors
-    stem_results: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {}
+    final_stems = {}
 
-    # 1. Vocals & Bass (SwiftF0)
-    for name in ["vocals", "bass"]:
-        if name in stems:
-            stem = stems[name]
-            det = SwiftF0Detector(stem.sr, hop_length, fmin=40.0, fmax=2000.0) # Tuned range
-            f0, conf = det.predict(stem.audio, audio_path=meta.audio_path)
-            stem_results[name] = [(f0, conf)]
+    # Separation
+    if sb_config.separation.get("enabled", True) and mix_stem is not None:
+        from .stage_a import apply_demucs # Circular import? Lazy import
 
-    # 2. Other (SACF + ISS) or Mix in Fast Mode
-    # Apply HPSS to "other" stem (or mono mix if processed as such)
+        # If we already have separated stems (e.g. from Stage A fast path?), Stage A output might have them.
+        # But my refactor of Stage A only returns 'mix' usually now.
+        # Let's run separation here.
+        model_name = sb_config.separation.get("model", "htdemucs")
+        demucs_stems = apply_demucs(mix_stem.audio, mix_stem.sr, model_name=model_name)
 
-    # Adaptive Params
-    is_lossy = meta.audio_quality == AudioQuality.LOSSY
-    sacf_bandwidth = 16000 if is_lossy else 20000
+        # Map 4-stem to our needs
+        # WI: "If 4-stem model: use 'other' for piano."
+        # WI: "If 6-stem model: use 'piano'."
 
-    target_stems_for_hpss = []
-    if "other" in stems:
-        target_stems_for_hpss.append("other")
+        # We assume standard 4-stem (vocals, bass, drums, other)
+        # We need to construct Stem objects
+        for name, audio in demucs_stems.items():
+            final_stems[name] = Stem(audio=audio, sr=mix_stem.sr, type=name)
 
-    for s_name in target_stems_for_hpss:
-        stem = stems[s_name]
+    else:
+        # No separation, everything is "mix" (treated as piano/other)
+        final_stems["mix"] = mix_stem
 
-        # HPSS
-        y_harmonic, y_percussive = librosa.effects.hpss(stem.audio)
-        stems[s_name].audio = y_harmonic
+    # 2. Detectors & Ensemble
+    # We need to process each stem according to Instrument Profiles
+    # WI 2.2.2 and 2.2.3
 
-    if "other" in stems:
-        stem = stems["other"]
-        # Consensus: SwiftF0 (Primary) + SACF (Validator)
-        primary = SwiftF0Detector(stem.sr, hop_length, fmin=60.0, fmax=2000.0)
-        # Ensure state is reset for new track
-        if hasattr(primary, 'reset_state'):
-            primary.reset_state()
+    # Define mapping of stem name to instrument profile name
+    # Default assumptions:
+    # 'vocals' -> 'vocals'
+    # 'bass' -> 'bass_guitar'
+    # 'other' -> 'piano_61key' (Goal is "Isolate piano", so 'other' is piano)
+    # 'mix' -> 'piano_61key' (if no separation)
 
-        validator = SACFDetector(stem.sr, hop_length, fmin=60.0, fmax=2000.0)
+    stem_profile_map = {
+        "vocals": "vocals",
+        "bass": "bass_guitar",
+        "other": "piano_61key",
+        "mix": "piano_61key"
+    }
 
-        extracted_tracks = iterative_spectral_subtraction(
-            stem.audio,
-            stem.sr,
-            primary,
-            validator,
-            max_polyphony=4,
-            audio_path=meta.audio_path
-        )
-        stem_results["other"] = extracted_tracks
+    # Global Time Grid (Master)
+    # WI: "All detectors must produce F0 at the same hop size"
+    # Let's fix a global hop length, say 256 samples @ 44100 -> ~5.8ms
+    global_sr = meta.target_sr
+    global_hop = meta.hop_length
+    n_frames_global = int(meta.duration_sec * global_sr / global_hop) + 1
+    times_global = librosa.frames_to_time(np.arange(n_frames_global), sr=global_sr, hop_length=global_hop)
 
-    # 3. Merge into Timeline & Create Stem Timelines
-    target_sr = meta.sample_rate
-    target_hop = meta.hop_length
+    per_detector_results = {}
+    f0_main_global = np.zeros(n_frames_global)
+    f0_layers_global = [] # List of F0 arrays
+    stem_timelines = {}
 
-    # Use meta.duration_sec to calculate frames
-    n_frames_global = int(meta.duration_sec * target_sr / target_hop) + 1
-    times_global = librosa.frames_to_time(np.arange(n_frames_global), sr=target_sr, hop_length=target_hop)
+    for stem_name, stem in final_stems.items():
+        if stem_name == "drums": continue # Skip drums for pitch
 
-    timeline: List[FramePitch] = []
-    stem_timelines: Dict[str, List[FramePitch]] = {}
+        profile_name = stem_profile_map.get(stem_name, "piano_61key")
+        profile = config.get_profile(profile_name)
+        if not profile: profile = config.get_profile("piano_61key")
 
-    # Helper to resample track
-    def resample_track(f0, conf, src_sr, src_hop):
-        n = len(f0)
-        times_src = librosa.frames_to_time(np.arange(n), sr=src_sr, hop_length=src_hop)
+        # Instantiate Detectors
+        # WI 2.2.2 Usage Rules
+        detectors = []
 
-        if n < 2: return np.zeros(n_frames_global), np.zeros(n_frames_global)
+        # Helper to add detector
+        def add_det(cls, name, **kwargs):
+             try:
+                 d = cls(sr=stem.sr, hop_length=global_hop, fmin=profile.fmin, fmax=profile.fmax, **kwargs)
+                 detectors.append((name, d))
+             except Exception as e:
+                 print(f"Failed to init {name}: {e}")
 
-        # Use Nearest Neighbor to preserve discrete pitches and avoid artifacts
-        # bounds_error=False, fill_value=0.0
-        f_func = scipy.interpolate.interp1d(times_src, f0, kind='nearest', bounds_error=False, fill_value=0.0)
-        c_func = scipy.interpolate.interp1d(times_src, conf, kind='linear', bounds_error=False, fill_value=0.0)
+        # Based on config.stage_b.detectors enablement AND profile recommendation
+        # WI says: "Use if available and configured."
+        # Also "Enabled per instrument profile" (RMVPE/CREPE)
 
-        f0_interp = f_func(times_global)
-        conf_interp = c_func(times_global)
+        # SwiftF0
+        if sb_config.detectors["swiftf0"]["enabled"]:
+             add_det(SwiftF0Detector, "swiftf0")
 
-        # Mask pitch where confidence is low
-        # Use parameterized confidence_threshold
-        f0_interp[conf_interp < confidence_threshold] = 0.0
+        # YIN
+        if sb_config.detectors["yin"]["enabled"]:
+             add_det(YinDetector, "yin")
 
-        # Apply Min Duration Filter if requested
-        # (Naive implementation on frame array: remove islands < min_frames)
-        if min_duration_ms > 0:
-             min_frames = int((min_duration_ms / 1000.0) * target_sr / target_hop)
-             if min_frames > 1:
-                 # Median filter can remove glitches
-                 # Or morphological opening
-                 # scipy.ndimage.binary_opening?
-                 # Let's use simple run-length logic or just medfilt
-                 # Medfilt size must be odd
-                 kernel = min_frames if min_frames % 2 == 1 else min_frames + 1
-                 f0_interp = scipy.signal.medfilt(f0_interp, kernel_size=kernel)
+        # SACF
+        if sb_config.detectors["sacf"]["enabled"]:
+             add_det(SACFDetector, "sacf")
 
-        return f0_interp, conf_interp
+        # CQT
+        if sb_config.detectors["cqt"]["enabled"]:
+             add_det(CQTDetector, "cqt")
 
-    # Collect all pitches per frame for the global merged view
-    frame_pitches_map = [[] for _ in range(n_frames_global)]
+        # RMVPE
+        if profile.recommended_algo == "rmvpe" or sb_config.detectors["rmvpe"]["enabled"]:
+             # Check profile special params
+             sil_thresh = profile.special.get("silence_threshold", 0.04)
+             add_det(RMVPEDetector, "rmvpe", silence_threshold=sil_thresh)
 
-    for name, tracks in stem_results.items():
-        if name not in stems: continue
-        stem_sr = stems[name].sr
-        stem_hop = hop_length
+        # CREPE
+        if profile.recommended_algo == "crepe" or sb_config.detectors["crepe"]["enabled"]:
+             viterbi = profile.special.get("viterbi", False)
+             add_det(CREPEDetector, "crepe", use_viterbi=viterbi)
 
-        stem_timelines[name] = []
-        stem_frame_pitches = [[] for _ in range(n_frames_global)]
 
-        for f0, conf in tracks:
-            f0_res, conf_res = resample_track(f0, conf, stem_sr, hop_length)
+        # Run Detectors
+        # Collect (f0, conf) for each
+        candidates_per_frame = [[] for _ in range(n_frames_global)]
+
+        stem_raw_results = {}
+
+        primary_det = None # For ISS
+        validator_det = None
+
+        for d_name, det in detectors:
+            if d_name == "swiftf0": primary_det = det
+            if d_name == "sacf": validator_det = det
+
+            # Predict
+            # Note: detectors are init with stem.sr, but output frames must match global grid.
+            # We enforce stem.sr == global_sr usually?
+            # If Stage A returns different SRs per stem?
+            # Stage A now returns all at target_sr for mix.
+            # But Separation (Demucs) might return 44.1k.
+            # If detectors are init with stem.sr, their hop_length needs to be adjusted?
+            # We passed global_hop.
+            # If stem.sr != global_sr, then hop_length implies different duration.
+            # We must resample audio to global_sr OR handle resampling of F0.
+            # Let's resample audio to global_sr if mismatch.
+
+            audio_for_det = stem.audio
+            if stem.sr != global_sr:
+                audio_for_det = librosa.resample(stem.audio, orig_sr=stem.sr, target_sr=global_sr)
+
+            f0, conf = det.predict(audio_for_det, audio_path=meta.audio_path)
+
+            # Ensure length matches
+            if len(f0) != n_frames_global:
+                # Pad or trim
+                if len(f0) > n_frames_global:
+                    f0 = f0[:n_frames_global]
+                    conf = conf[:n_frames_global]
+                else:
+                    pad = n_frames_global - len(f0)
+                    f0 = np.pad(f0, (0, pad))
+                    conf = np.pad(conf, (0, pad))
+
+            stem_raw_results[d_name] = (f0, conf)
 
             for i in range(n_frames_global):
-                if f0_res[i] > 10.0:
-                    frame_pitches_map[i].append((f0_res[i], conf_res[i]))
-                    stem_frame_pitches[i].append((f0_res[i], conf_res[i]))
+                candidates_per_frame[i].append({
+                    "name": d_name,
+                    "f0": f0[i],
+                    "conf": conf[i]
+                })
+
+        per_detector_results[stem_name] = stem_raw_results
+
+        # 2.2.3 Ensemble Logic (Monophonic / Main Track)
+
+        stem_f0 = np.zeros(n_frames_global)
+        stem_conf = np.zeros(n_frames_global)
+
+        weights = sb_config.ensemble_weights
+        priority_floor = sb_config.confidence_priority_floor
+        disagreement_cents = sb_config.pitch_disagreement_cents
 
         for i in range(n_frames_global):
-            active = stem_frame_pitches[i]
-            active.sort(key=lambda x: x[1], reverse=True)
+            cands = candidates_per_frame[i]
+            if not cands: continue
 
-            s_pitch = active[0][0] if active else 0.0
-            s_conf = active[0][1] if active else 0.0
-            s_midi = int(round(hz_to_midi(s_pitch))) if s_pitch > 0 else None
+            # Priority Override (SwiftF0)
+            swift = next((c for c in cands if c["name"] == "swiftf0"), None)
+
+            final_f0 = 0.0
+            final_conf = 0.0
+
+            # Check disagreement
+            valid_pitches = [c["f0"] for c in cands if c["f0"] > 10.0 and c["conf"] > 0.1]
+            disagreement = False
+            if valid_pitches:
+                min_p = min(valid_pitches)
+                max_p = max(valid_pitches)
+                diff_cents = 1200 * np.log2(max_p / min_p)
+                if diff_cents > disagreement_cents:
+                    disagreement = True
+
+            if swift and swift["conf"] >= priority_floor and not disagreement:
+                final_f0 = swift["f0"]
+                final_conf = swift["conf"]
+            else:
+                # Weighted Average
+                num = 0.0
+                den = 0.0
+                max_c = 0.0
+                for c in cands:
+                    w = weights.get(c["name"], 0.5)
+                    if c["f0"] > 10.0:
+                        num += c["f0"] * c["conf"] * w
+                        den += c["conf"] * w
+                        if c["conf"] > max_c: max_c = c["conf"]
+
+                if den > 0:
+                    final_f0 = num / den
+                    final_conf = max_c
+
+            # Thresholding
+            if final_conf < sb_config.confidence_voicing_threshold:
+                final_f0 = 0.0
+
+            stem_f0[i] = final_f0
+            stem_conf[i] = final_conf
+
+        # Smoothing
+        kernel = profile.special.get("ensemble_smoothing_frames", 3)
+        if kernel > 1:
+            stem_f0 = scipy.signal.medfilt(stem_f0, kernel_size=kernel)
+
+        # Store main track for this stem
+        # If this is "other" or "piano", we also run Polyphonic Peeling
+
+        stem_layers = []
+        if profile_name == "piano_61key" and primary_det and validator_det:
+            # Polyphonic Peeling
+             # Ensure state reset
+            if hasattr(primary_det, 'reset_state'): primary_det.reset_state()
+
+            audio_for_iss = stem.audio
+            if stem.sr != global_sr:
+                 audio_for_iss = librosa.resample(stem.audio, orig_sr=stem.sr, target_sr=global_sr)
+
+            extracted = iterative_spectral_subtraction(
+                audio_for_iss,
+                global_sr,
+                primary_det,
+                validator_det,
+                max_polyphony=sb_config.polyphonic_peeling["max_layers"],
+                mask_width=sb_config.polyphonic_peeling["mask_width"],
+                audio_path=meta.audio_path
+            )
+
+            # Extracted contains [(f0, conf), (f0, conf)...]
+            # Layer 0 is usually the main one, but Ensemble might be better for main.
+            # Let's trust Ensemble for main, and use ISS for layers?
+            # Or use ISS entirely?
+            # WI says "Output ... f0_main ... f0_layers".
+            # "f0_main (monophonic track or skyline)".
+            # If ISS runs, f0_main should be the first peeled layer (dominant).
+            # But we calculated Ensemble above.
+            # Let's replace stem_f0 with extracted[0] if available and better?
+            # Actually, ISS with SwiftF0 Primary IS the ensemble logic in a way (SwiftF0 dominates).
+
+            if extracted:
+                 # Override main with ISS first layer
+                 e0 = extracted[0][0]
+                 e_conf = extracted[0][1]
+                 if len(e0) != n_frames_global:
+                     e0 = np.pad(e0, (0, max(0, n_frames_global - len(e0))))[:n_frames_global]
+                     e_conf = np.pad(e_conf, (0, max(0, n_frames_global - len(e_conf))))[:n_frames_global]
+
+                 stem_f0 = e0
+                 stem_conf = e_conf
+
+                 # Remaining are layers
+                 for lay in extracted[1:]:
+                     # Normalize length
+                     lf0 = lay[0]
+                     if len(lf0) != n_frames_global:
+                         lf0 = np.pad(lf0, (0, max(0, n_frames_global - len(lf0))))[:n_frames_global]
+                     stem_layers.append(lf0)
+
+        # Build FramePitch objects for this stem
+        tl = []
+        for i in range(n_frames_global):
+            active = []
+            if stem_f0[i] > 0:
+                active.append((stem_f0[i], stem_conf[i]))
+            for l in stem_layers:
+                if l[i] > 0:
+                    active.append((l[i], 0.8)) # Dummy conf for layers if not tracked
+
+            active.sort(key=lambda x: x[1], reverse=True)
 
             fp = FramePitch(
                 time=times_global[i],
-                pitch_hz=s_pitch,
-                midi=s_midi,
-                confidence=s_conf,
-                rms=0.0,
+                pitch_hz=active[0][0] if active else 0.0,
+                midi=int(round(hz_to_midi(active[0][0]))) if active else None,
+                confidence=active[0][1] if active else 0.0,
                 active_pitches=active
             )
-            stem_timelines[name].append(fp)
+            tl.append(fp)
 
-    # Build Global Timeline
-    global_rms = np.zeros(n_frames_global)
+        stem_timelines[stem_name] = tl
 
-    for i in range(n_frames_global):
-        active = frame_pitches_map[i]
-        active.sort(key=lambda x: x[1], reverse=True)
-
-        dom_pitch = 0.0
-        dom_conf = 0.0
-        dom_midi = None
-
-        if active:
-            dom_pitch = active[0][0]
-            dom_conf = active[0][1]
-            dom_midi = int(round(hz_to_midi(dom_pitch)))
-
-        fp = FramePitch(
-            time=times_global[i],
-            pitch_hz=dom_pitch,
-            midi=dom_midi,
-            confidence=dom_conf,
-            rms=global_rms[i],
-            active_pitches=active
-        )
-        timeline.append(fp)
-
-    # 4. Smoothing (Global Timeline only)
-    dom_pitches = np.array([fp.pitch_hz for fp in timeline])
-    smoothed = scipy.signal.medfilt(dom_pitches, kernel_size=5)
-
-    for i in range(len(timeline)):
-        if smoothed[i] > 0:
-            timeline[i].pitch_hz = float(smoothed[i])
-            timeline[i].midi = int(round(hz_to_midi(smoothed[i])))
+        # Aggregate to global (Skyline or Mix)
+        # If multiple stems, how to combine?
+        # Vocals + Piano -> Polyphony.
+        # We add them as layers.
+        if len(stem_timelines) == 1:
+            f0_main_global = stem_f0
+            f0_layers_global = stem_layers
         else:
-            timeline[i].pitch_hz = 0.0
-            timeline[i].midi = None
+            # Simple aggregation logic: Max confidence wins for Main?
+            # Or just append all valid pitches to layers
+            # Here we keep f0_main as the "Melody" (Vocals usually)
+            if stem_name == "vocals":
+                f0_main_global = stem_f0
+            elif stem_name == "other" or stem_name == "piano":
+                f0_layers_global.append(stem_f0)
+                f0_layers_global.extend(stem_layers)
 
-    return timeline, [], [], stem_timelines
+    return StageBOutput(
+        time_grid=times_global,
+        f0_main=f0_main_global,
+        f0_layers=f0_layers_global,
+        per_detector=per_detector_results,
+        stem_timelines=stem_timelines
+    )

@@ -65,6 +65,17 @@ class StageAOutput:
     audio_type: AudioType
 
 
+# ---------- Stage B Output Structures ----------
+
+@dataclass
+class StageBOutput:
+    time_grid: np.ndarray              # Array of time stamps
+    f0_main: np.ndarray                # Main pitch track (or skyline)
+    f0_layers: List[np.ndarray]        # Polyphonic layers
+    per_detector: Dict[str, Any]       # Raw outputs from each detector: "swiftf0": (f0, conf), ...
+    stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict) # Processed timelines
+
+
 # ---------- Pitch timeline ----------
 
 @dataclass
@@ -101,6 +112,8 @@ class NoteEvent:
     rms_value: float = 0.0             # Raw RMS energy (linear)
     is_grace: bool = False
     dynamic: str = "mf"                # "p", "mf", "f", etc.
+    voice: int = 1                     # Voice index
+    staff: str = "treble"              # "treble" or "bass"
 
     # Musical grid (filled after quantization)
     measure: Optional[int] = None
@@ -180,6 +193,8 @@ class AnalysisData:
                     "rms_value": e.rms_value,
                     "is_grace": e.is_grace,
                     "dynamic": e.dynamic,
+                    "voice": e.voice,
+                    "staff": e.staff,
                     "measure": e.measure,
                     "beat": e.beat,
                     "duration_beats": e.duration_beats,

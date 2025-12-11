@@ -2,34 +2,26 @@ from typing import List, Optional, Set, Dict, Tuple
 import numpy as np
 import librosa
 import scipy.signal
-from dataclasses import dataclass
-from .models import NoteEvent, AnalysisData, FramePitch, MetaData, AlternativePitch, AudioQuality
+from .models import NoteEvent, AnalysisData, FramePitch, MetaData, AudioQuality
+from .config import PIANO_61KEY_CONFIG, StageCConfig, PipelineConfig
 
-# Constants for Stage C
+# Constants for HMM
 HMM_STATE_SILENCE = 0
 HMM_STATE_ATTACK = 1
 HMM_STATE_STABLE = 2
 HMM_NUM_STATES = 3
 
 def hz_to_midi(hz: float) -> float:
-    if hz <= 0:
-        return 0.0
+    if hz <= 0: return 0.0
     return 69.0 + 12.0 * np.log2(hz / 440.0)
 
 def midi_to_hz(midi: float) -> float:
     return 440.0 * (2.0 ** ((midi - 69.0) / 12.0))
 
-# --------------------------------------------------------------------------
-# HMM Processor for Monophonic Stems (Vocals/Bass)
-# --------------------------------------------------------------------------
-
 class HMMProcessor:
-    """
-    Implements Hidden Markov Model decoding for pitch tracking as per Report Section 7.
-    States: Silence (0), Attack (1), Stable (2).
-    """
-    def __init__(self, fps: float = 100.0):
-        self.fps = fps
+    def __init__(self, config: StageCConfig):
+        self.config = config
+        # Transition Probabilities (Could be configurable, but hardcoded robust logic for now)
         self.trans_mat = np.array([
             [0.99, 0.01, 0.00], # From Silence
             [0.10, 0.00, 0.90], # From Attack
@@ -40,134 +32,125 @@ class HMMProcessor:
 
     def decode(self, timeline: List[FramePitch]) -> List[int]:
         n_frames = len(timeline)
-        if n_frames == 0:
-            return []
+        if n_frames == 0: return []
 
         emission = np.zeros((HMM_NUM_STATES, n_frames))
 
         for t, fp in enumerate(timeline):
             conf = fp.confidence
-            emission[HMM_STATE_SILENCE, t] = self._prob_silence(conf)
-            emission[HMM_STATE_ATTACK, t] = self._prob_attack(conf)
-            emission[HMM_STATE_STABLE, t] = self._prob_stable(conf)
+            # Heuristic Emission Probs
+            # Silence: High prob if conf low
+            emission[HMM_STATE_SILENCE, t] = np.exp(-5.0 * conf)
+            # Attack: Transient? We don't have transient info passed here explicitly,
+            # but high confidence onset usually looks like attack.
+            emission[HMM_STATE_ATTACK, t] = 0.3 # Constant bias
+            # Stable: High prob if conf high
+            emission[HMM_STATE_STABLE, t] = 1.0 / (1.0 + np.exp(-10.0 * (conf - 0.5)))
 
-        state_seq = librosa.sequence.viterbi(emission, self.trans_mat, p_init=self.start_prob)
-        return state_seq
-
-    def _prob_silence(self, conf: float) -> float:
-        return np.exp(-5.0 * conf)
-
-    def _prob_stable(self, conf: float) -> float:
-        return 1.0 / (1.0 + np.exp(-10.0 * (conf - 0.5)))
-
-    def _prob_attack(self, conf: float) -> float:
-        return 0.3
+        try:
+             state_seq = librosa.sequence.viterbi(emission, self.trans_mat, p_init=self.start_prob)
+             return state_seq
+        except Exception:
+             return [HMM_STATE_SILENCE] * n_frames
 
     def segment_notes(self, timeline: List[FramePitch], states: List[int]) -> List[NoteEvent]:
-        """
-        Converts state sequence back to NoteEvents.
-        Includes LEGATO Fix: splitting note if pitch jumps significantly.
-        """
         notes = []
         current_note_start = -1
-        current_midi_sum = 0.0
-        current_hz_sum = 0.0
-        current_count = 0
-        current_conf_sum = 0.0
-        curr_avg_midi = 0.0
+        accum_data = {'midi': [], 'hz': [], 'conf': [], 'rms': []}
+
+        min_frames = self.config.frame_stability.get("stable_frames_required", 2)
+        min_dur_sec = self.config.min_note_duration_ms / 1000.0
 
         for t, state in enumerate(states):
-            is_note_state = (state == HMM_STATE_STABLE) or (state == HMM_STATE_ATTACK)
+            is_note = (state == HMM_STATE_STABLE) or (state == HMM_STATE_ATTACK)
 
-            if is_note_state:
+            if is_note:
                 if current_note_start == -1:
                     current_note_start = t
-                    # Reset accum
-                    current_midi_sum = 0.0
-                    current_hz_sum = 0.0
-                    current_count = 0
-                    current_conf_sum = 0.0
-                    curr_avg_midi = 0.0
 
-                # Accumulate statistics for pitch estimation
-                if timeline[t].pitch_hz > 0:
-                     new_midi = hz_to_midi(timeline[t].pitch_hz)
+                # Frame Stability Check (if just started)
+                # (Simple check: if we are in state note, we accumulate)
 
-                     # LEGATO CHECK
-                     if current_count > 5: # Need some history to establish average
-                         curr_avg_midi = current_midi_sum / current_count
-                         if abs(new_midi - curr_avg_midi) > 0.8:
-                             # Force Split
-                             self._create_note(notes, timeline, current_note_start, t, current_midi_sum, current_hz_sum, current_conf_sum, current_count)
-                             # Start New Note immediately
+                fp = timeline[t]
+                if fp.pitch_hz > 0:
+                     accum_data['midi'].append(hz_to_midi(fp.pitch_hz))
+                     accum_data['hz'].append(fp.pitch_hz)
+                     accum_data['conf'].append(fp.confidence)
+                     accum_data['rms'].append(fp.rms)
+
+                     # LEGATO / PITCH JUMP CHECK
+                     if len(accum_data['midi']) > 5:
+                         curr_avg = np.mean(accum_data['midi'][-5:])
+                         last_avg = np.mean(accum_data['midi'][:-1])
+                         if abs(curr_avg - last_avg) > 0.8: # Jump
+                             # Split
+                             self._close_note(notes, timeline, current_note_start, t, accum_data, min_dur_sec)
                              current_note_start = t
-                             current_midi_sum = 0.0
-                             current_hz_sum = 0.0
-                             current_count = 0
-                             current_conf_sum = 0.0
-                             curr_avg_midi = 0.0
+                             accum_data = {'midi': [hz_to_midi(fp.pitch_hz)], 'hz': [fp.pitch_hz], 'conf': [fp.confidence], 'rms': [fp.rms]}
 
-                     current_hz_sum += timeline[t].pitch_hz
-                     current_midi_sum += new_midi
-                     current_conf_sum += timeline[t].confidence
-                     current_count += 1
             else:
-                # Silence state
                 if current_note_start != -1:
-                    # Note ended
-                    self._create_note(notes, timeline, current_note_start, t, current_midi_sum, current_hz_sum, current_conf_sum, current_count)
+                    self._close_note(notes, timeline, current_note_start, t, accum_data, min_dur_sec)
                     current_note_start = -1
-                    current_midi_sum = 0.0
-                    current_hz_sum = 0.0
-                    current_count = 0
-                    current_conf_sum = 0.0
-                    curr_avg_midi = 0.0
+                    accum_data = {'midi': [], 'hz': [], 'conf': [], 'rms': []}
 
-        # Close open note
         if current_note_start != -1:
-             self._create_note(notes, timeline, current_note_start, len(states), current_midi_sum, current_hz_sum, current_conf_sum, current_count)
+             self._close_note(notes, timeline, current_note_start, len(states), accum_data, min_dur_sec)
 
-        return notes
+        # Gap Filling (Legato)
+        # "If gap_ms <= max_gap_ms, and pitch similar, merge."
+        max_gap_sec = self.config.gap_filling.get("max_gap_ms", 100.0) / 1000.0
+        merged_notes = []
+        if notes:
+            merged_notes.append(notes[0])
+            for i in range(1, len(notes)):
+                curr = notes[i]
+                prev = merged_notes[-1]
+                gap = curr.start_sec - prev.end_sec
+                if gap <= max_gap_sec and abs(curr.midi_note - prev.midi_note) < (self.config.pitch_tolerance_cents / 100.0):
+                    # Merge
+                    prev.end_sec = curr.end_sec
+                    # Update averages? keep prev usually fine.
+                else:
+                    merged_notes.append(curr)
 
-    def _create_note(self, notes, timeline, start_idx, end_idx, m_sum, h_sum, c_sum, count):
-        if count < 5: return # Filter short notes (ghosts)
+        return merged_notes
 
-        avg_midi = m_sum / count
-        avg_hz = h_sum / count
-        avg_conf = c_sum / count
+    def _close_note(self, notes, timeline, start, end, data, min_dur_sec):
+        dur = timeline[end-1].time - timeline[start].time
+        if dur < min_dur_sec: return
 
-        # Round midi
-        midi_note = int(round(avg_midi))
+        if not data['hz']: return
 
-        start_t = timeline[start_idx].time
-        end_t = timeline[end_idx-1].time if end_idx > 0 else start_t + 0.01
+        avg_hz = np.mean(data['hz'])
+        avg_conf = np.mean(data['conf'])
+        avg_rms = np.mean(data['rms']) if data['rms'] else 0.0
+        midi_note = int(round(hz_to_midi(avg_hz)))
 
         notes.append(NoteEvent(
-            start_sec=start_t,
-            end_sec=end_t,
+            start_sec=timeline[start].time,
+            end_sec=timeline[end-1].time,
             midi_note=midi_note,
-            pitch_hz=avg_hz,
-            confidence=avg_conf,
-            rms_value=0.5 # Placeholder
+            pitch_hz=float(avg_hz),
+            confidence=float(avg_conf),
+            rms_value=float(avg_rms)
         ))
 
-# --------------------------------------------------------------------------
-# Greedy Processor for Polyphonic Stems (Other)
-# --------------------------------------------------------------------------
 
 class GreedyPolyProcessor:
-    def __init__(self):
+    def __init__(self, config: StageCConfig):
+        self.config = config
         self.active_tracks = []
-        self.min_duration_frames = 5
         self.match_tolerance = 0.7
 
     def process(self, timeline: List[FramePitch]) -> List[NoteEvent]:
         notes = []
         active_tracks = []
+        min_dur_sec = self.config.min_note_duration_ms / 1000.0
 
         for t, frame in enumerate(timeline):
             curr_time = frame.time
-            candidates = frame.active_pitches
+            candidates = frame.active_pitches # [(hz, conf), ...]
             cand_midi = []
             for hz, conf in candidates:
                 if hz > 40:
@@ -188,28 +171,29 @@ class GreedyPolyProcessor:
 
                 if best_match:
                     best_match['used'] = True
+                    # Update track state
                     track['midi'] = 0.8 * track['midi'] + 0.2 * best_match['midi']
-                    track['hz_accum'] += best_match['hz']
-                    track['conf_accum'] += best_match['conf']
-                    track['count'] += 1
-                    track['last_seen'] = t
+                    track['hz_accum'].append(best_match['hz'])
+                    track['conf_accum'].append(best_match['conf'])
                     track['end_t'] = curr_time
+                    track['last_seen'] = t
                     next_tracks.append(track)
                 else:
-                    if t - track['last_seen'] > 3:
-                        self._finalize_track(notes, track)
+                    # Lost track
+                    if t - track['last_seen'] > 3: # 3 frames tolerance dropout
+                        self._finalize_track(notes, track, min_dur_sec)
                     else:
                         next_tracks.append(track)
 
+            # Spawn new
             for c in cand_midi:
-                if not c['used'] and c['conf'] > 0.15:
+                if not c['used'] and c['conf'] > 0.15: # Start threshold
                     new_track = {
                         'midi': c['midi'],
                         'start_t': curr_time,
                         'end_t': curr_time,
-                        'hz_accum': c['hz'],
-                        'conf_accum': c['conf'],
-                        'count': 1,
+                        'hz_accum': [c['hz']],
+                        'conf_accum': [c['conf']],
                         'last_seen': t
                     }
                     next_tracks.append(new_track)
@@ -217,47 +201,41 @@ class GreedyPolyProcessor:
             active_tracks = next_tracks
 
         for track in active_tracks:
-            self._finalize_track(notes, track)
+            self._finalize_track(notes, track, min_dur_sec)
 
         return notes
 
-    def _finalize_track(self, notes, track):
-        if track['count'] < self.min_duration_frames:
-            return
+    def _finalize_track(self, notes, track, min_dur_sec):
+        dur = track['end_t'] - track['start_t']
+        if dur < min_dur_sec: return
 
-        avg_hz = track['hz_accum'] / track['count']
-        avg_conf = track['conf_accum'] / track['count']
+        avg_hz = np.mean(track['hz_accum'])
+        avg_conf = np.mean(track['conf_accum'])
         midi_note = int(round(track['midi']))
 
         notes.append(NoteEvent(
             start_sec=track['start_t'],
             end_sec=track['end_t'],
             midi_note=midi_note,
-            pitch_hz=avg_hz,
-            confidence=avg_conf,
-            rms_value=0.5
+            pitch_hz=float(avg_hz),
+            confidence=float(avg_conf),
+            rms_value=0.5 # Placeholder
         ))
 
-# --------------------------------------------------------------------------
-# Adaptive Tuning
-# --------------------------------------------------------------------------
+# --- Utils ---
 
 def estimate_global_tuning_offset(notes: List[NoteEvent]) -> float:
-    if not notes:
-        return 0.0
+    if not notes: return 0.0
     deviations = []
     for n in notes:
         raw_midi = hz_to_midi(n.pitch_hz)
         dev = raw_midi - round(raw_midi)
         deviations.append(dev)
 
-    if not deviations:
-        return 0.0
-
+    if not deviations: return 0.0
     hist, bins = np.histogram(deviations, bins=50, range=(-0.5, 0.5))
     peak_idx = np.argmax(hist)
     center_val = (bins[peak_idx] + bins[peak_idx+1]) / 2.0
-
     return center_val
 
 def apply_tuning(notes: List[NoteEvent], offset: float):
@@ -266,154 +244,85 @@ def apply_tuning(notes: List[NoteEvent], offset: float):
         corrected_midi = raw_midi - offset
         n.midi_note = int(round(corrected_midi))
 
-# --------------------------------------------------------------------------
-# Main Stage C Logic
-# --------------------------------------------------------------------------
+def map_velocity(notes: List[NoteEvent], config: StageCConfig):
+    # vel = min_vel + (db - min_db) * (max_vel - min_vel) / (max_db - min_db)
+    v_map = config.velocity_map
+    min_db, max_db = v_map["min_db"], v_map["max_db"]
+    min_v, max_v = v_map["min_vel"], v_map["max_vel"]
+
+    for n in notes:
+        # RMS to dB
+        if n.rms_value <= 0: db = -80
+        else: db = 20 * np.log10(n.rms_value)
+
+        clamped = max(min_db, min(max_db, db))
+        ratio = (clamped - min_db) / (max_db - min_db)
+
+        vel = min_v + ratio * (max_v - min_v)
+        n.velocity = vel / 127.0 # Normalize 0-1 for model
+
+        # Dynamic marking
+        if vel < 45: n.dynamic = "p"
+        elif vel < 80: n.dynamic = "mf"
+        else: n.dynamic = "f"
+
+# --- Main Stage C ---
 
 def apply_theory(
-    unused_input_notes: List[NoteEvent], # Legacy argument, ignored in favor of analysis_data
     analysis_data: AnalysisData,
+    config: PipelineConfig = PIANO_61KEY_CONFIG,
 ) -> List[NoteEvent]:
-    """
-    Stage C: Polyphonic Segmentation & Quantization
-    """
-    # 1. Routing
-    stem_timelines = analysis_data.stem_timelines
 
+    stage_c_conf = config.stage_c
+    stem_timelines = analysis_data.stem_timelines
     all_notes = []
 
-    # Helper: Onset Snapping
-    def snap_notes_to_onsets(notes: List[NoteEvent], onsets: List[float], tol: float = 0.05):
-        if not onsets: return
-        onsets_arr = np.array(onsets)
-
-        for note in notes:
-            # Find nearest onset
-            diffs = np.abs(onsets_arr - note.start_sec)
-            idx = np.argmin(diffs)
-            min_diff = diffs[idx]
-
-            # Snap if within tolerance (50ms)
-            if min_diff <= tol:
-                if onsets_arr[idx] < note.end_sec:
-                    note.start_sec = float(onsets_arr[idx])
-
-    # 2. Process Vocals/Bass (HMM)
-    hmm_proc = HMMProcessor()
-
-    for stem_name in ['vocals', 'bass']:
-        if stem_name in stem_timelines:
-            # Run HMM
-            track = stem_timelines[stem_name]
-            states = hmm_proc.decode(track)
-            notes = hmm_proc.segment_notes(track, states)
-
-            # SNAP TO ONSETS
-            if stem_name in analysis_data.stem_onsets:
-                snap_notes_to_onsets(notes, analysis_data.stem_onsets[stem_name])
-
+    # Process Vocals/Bass with HMM (Monophonic)
+    hmm_proc = HMMProcessor(stage_c_conf)
+    for stem in ['vocals', 'bass']:
+        if stem in stem_timelines:
+            tl = stem_timelines[stem]
+            states = hmm_proc.decode(tl)
+            notes = hmm_proc.segment_notes(tl, states)
+            for n in notes:
+                n.voice = 1 # Lead
+                n.staff = "treble" if stem == "vocals" else "bass"
             all_notes.extend(notes)
 
-    # 3. Process Other (Greedy)
-    greedy_proc = GreedyPolyProcessor()
+    # Process Other/Piano with Greedy (Polyphonic)
+    greedy_proc = GreedyPolyProcessor(stage_c_conf)
+    for stem in ['other', 'piano', 'mix']:
+        if stem in stem_timelines:
+            tl = stem_timelines[stem]
+            notes = greedy_proc.process(tl)
+            for n in notes:
+                n.voice = 1
+                # Staff determined later in Stage D
+                # But we can set default
+                n.staff = "treble"
+            all_notes.extend(notes)
 
-    if 'other' in stem_timelines:
-        track = stem_timelines['other']
-        # This track has active_pitches populated
-        notes = greedy_proc.process(track)
-        all_notes.extend(notes)
+    # Adaptive Tuning
+    offset = estimate_global_tuning_offset(all_notes)
+    analysis_data.meta.tuning_offset = offset
+    apply_tuning(all_notes, offset)
 
-    # Fallback: If no stems (legacy mode), use main timeline with HMM?
-    # Or Greedy if polyphonic?
-    if not all_notes and analysis_data.timeline:
-        # Check audio type
-        is_poly = analysis_data.meta.audio_type != "monophonic"
-        if is_poly:
-            notes = greedy_proc.process(analysis_data.timeline)
-        else:
-            states = hmm_proc.decode(analysis_data.timeline)
-            notes = hmm_proc.segment_notes(analysis_data.timeline, states)
-        all_notes.extend(notes)
+    # Velocity Mapping
+    map_velocity(all_notes, stage_c_conf)
 
-    # 4. Adaptive Tuning
-    tuning_offset = estimate_global_tuning_offset(all_notes)
-    analysis_data.meta.tuning_offset = tuning_offset
-    apply_tuning(all_notes, tuning_offset)
-
-    # 5. Quantize
-    analysis_data.notes = all_notes
-    quantized_notes = quantize_notes(all_notes, analysis_data)
-
-    return quantized_notes
-
-def quantize_notes(notes: List[NoteEvent], analysis_data: AnalysisData) -> List[NoteEvent]:
-    """
-    Quantize to 1/16th grid (PPQ 120).
-    Uses beats/onsets if available for grid alignment.
-    """
+    # Quantize (Simple Grid Assignment)
+    # Note: Stage D does more complex XML timing, but we assign grid data here.
     bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else 120.0
     quarter_dur = 60.0 / bpm
-    ticks_per_quarter = 120
-    ticks_per_sixteenth = 30
-    ticks_per_measure = 480
-    sec_per_tick = quarter_dur / ticks_per_quarter
 
-    # Grid Alignment Logic
-    # If we have detected beats, we can try to align the grid to the first beat.
-    grid_offset_sec = 0.0
-    if analysis_data.beats and len(analysis_data.beats) > 0:
-        # Assume the first beat is the start of a measure or beat.
-        # Ideally we find the 'downbeat', but for now align to first detected beat.
-        # But beat tracking can be noisy.
-        # Let's align such that the first note's start is closest to a grid point.
-        # Or just use the first beat time as an anchor?
-        # User requirement: "Use beats (timestamps) to align the quantization grid"
+    # Align to beats if available
+    # For now, simple quantization
+    for n in all_notes:
+        n.duration_beats = (n.end_sec - n.start_sec) / quarter_dur
+        # Note: 'measure' and 'beat' are left None, to be filled by music21 in Stage D or complex logic here.
+        # WI says "Output ... Each note a dict ... duration_sec, velocity".
+        # Stage D "Turn note events into valid MusicXML ... Sum divisions in a measure".
+        # So Stage D handles the measure wrapping.
 
-        # Simple alignment: Shift time so that the first beat is at a beat boundary.
-        # But we modify the grid, not the notes? Or we modify notes relative to grid.
-        # Actually, simpler: define grid based on beats.
-        # But constant BPM implies linear grid.
-        # If we have variable beats, we should use a tempo map, but current architecture assumes constant BPM (MetaData.tempo_bpm).
-        # So we will just use a constant offset based on the first beat.
-
-        first_beat = analysis_data.beats[0]
-        # Align grid so that 'first_beat' lands on a quarter note tick.
-        # We can subtract first_beat from all note times, quantize, then add it back?
-        # Or just offset the grid.
-        grid_offset_sec = first_beat % quarter_dur
-        # If offset is large (close to quarter_dur), it might be 0.
-        if grid_offset_sec > quarter_dur / 2:
-            grid_offset_sec -= quarter_dur
-
-    # Apply offset to grid calculation:
-    # t_shifted = t - grid_offset
-    # ticks = t_shifted / sec_per_tick
-
-    for note in notes:
-        # Align to grid
-        start_aligned = note.start_sec - grid_offset_sec
-        end_aligned = note.end_sec - grid_offset_sec
-
-        start_ticks = round(start_aligned / sec_per_tick)
-        end_ticks = round(end_aligned / sec_per_tick)
-
-        # Snap to grid (30 ticks)
-        start_ticks = round(start_ticks / ticks_per_sixteenth) * ticks_per_sixteenth
-        end_ticks = round(end_ticks / ticks_per_sixteenth) * ticks_per_sixteenth
-
-        if end_ticks <= start_ticks:
-            end_ticks = start_ticks + ticks_per_sixteenth
-
-        measure_idx = (start_ticks // ticks_per_measure)
-        note.measure = measure_idx + 1
-
-        rem_ticks = start_ticks % ticks_per_measure
-        note.beat = (rem_ticks / ticks_per_quarter) + 1.0
-
-        dur_ticks = end_ticks - start_ticks
-        note.duration_beats = float(dur_ticks) / ticks_per_quarter
-
-        note.start_sec = (start_ticks * sec_per_tick) + grid_offset_sec
-        note.end_sec = note.start_sec + (note.duration_beats * quarter_dur)
-
-    return notes
+    analysis_data.notes = all_notes
+    return all_notes
