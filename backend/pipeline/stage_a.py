@@ -275,7 +275,7 @@ def load_and_preprocess(
     # Default tempo if detection failed
     tempo_bpm = float(bpm) if bpm is not None else 120.0
 
-    meta = MetaData(
+       meta = MetaData(
         tuning_offset=0.0,
         detected_key="C",  # can be updated later by key detection
         lufs=float(config.loudness_normalization.get("target_lufs", -23.0)),
@@ -291,17 +291,19 @@ def load_and_preprocess(
 
         original_sr=orig_sr,
         target_sr=target_sr,
-        duration_sec=len(y_norm) / float(sr),
+        duration_sec=float(len(y_norm) / sr),
 
         audio_path=audio_path,
-        n_channels=1,
-        normalization_gain_db=norm_gain,
+        n_channels=n_channels,
+        normalization_gain_db=norm_gain_db,
         rms_db=rms_db,
+        # ✅ store Stage A diagnostics into MetaData
+        noise_floor_rms=float(noise_floor_rms),
+        noise_floor_db=float(noise_floor_db),
         pipeline_version="2.0.0",
+        # ✅ also store the beat grid directly in MetaData
+        beats=list(beats),
     )
-
-    # NOTE: beat timestamps are not stored in MetaData; they are expected to be
-    # attached later to AnalysisData.beats in the main pipeline if needed.
 
     # -----------------------------
     # 13. StageAOutput
@@ -310,4 +312,8 @@ def load_and_preprocess(
         stems=stems_output,
         meta=meta,
         audio_type=audio_type,
+        # ✅ expose diagnostics at Stage A level too
+        noise_floor_rms=float(noise_floor_rms),
+        noise_floor_db=float(noise_floor_db),
+        beats=list(beats),
     )
