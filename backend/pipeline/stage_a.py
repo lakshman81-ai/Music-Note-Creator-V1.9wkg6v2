@@ -11,39 +11,19 @@ import torch
 from demucs import pretrained
 from demucs.apply import apply_model
 from .models import MetaData, AudioType, AudioQuality, Stem, StageAOutput
-
-# Constants
-TARGET_LUFS = -23.0  # EBU R128 standard
-MIN_DURATION_SEC = 0.120 # 120 ms
-MAX_DURATION_SEC = 600.0
-SILENCE_THRESHOLD_DB = 40  # top_db for trim
-
-# Demucs Model
-DEMUCS_MODEL_NAME = 'htdemucs'
+from .config import PIANO_61KEY_CONFIG, StageAConfig
 
 def detect_audio_type(y: np.ndarray, sr: int) -> AudioType:
     """
     Heuristic to detect if audio is Monophonic or Polyphonic.
-    Uses spectral flatness and crest factor.
     """
-    # 1. Compute Spectral Flatness
-    # High flatness -> Noise-like or complex polyphony
-    # Low flatness -> Tonal (sine wave)
     flatness = librosa.feature.spectral_flatness(y=y)
     mean_flatness = np.mean(flatness)
 
-    # 2. Spectral Crest Factor (Peakiness)
-    # Monophonic signals often have distinct harmonic peaks (high crest factor).
-    # Polyphonic signals have denser spectra (lower crest factor).
-    # We approximate this via standard deviation of magnitude spectrum.
     S = np.abs(librosa.stft(y))
-    # Simple proxy: sparsity or contrast.
-    # Let's use spectral contrast
     contrast = librosa.feature.spectral_contrast(S=S, sr=sr)
     mean_contrast = np.mean(contrast)
 
-    # Heuristic Thresholds (Tuned loosely for now)
-    # Monophonic usually has high contrast (clear peaks vs valleys) and low flatness.
     if mean_flatness < 0.05 and mean_contrast > 20.0:
         return AudioType.MONOPHONIC
     elif mean_flatness < 0.2:
@@ -51,52 +31,36 @@ def detect_audio_type(y: np.ndarray, sr: int) -> AudioType:
     else:
         return AudioType.POLYPHONIC
 
-def warped_linear_prediction(y: np.ndarray, sr: int, order: int = 16, warping: float = 0.7) -> np.ndarray:
+def warped_linear_prediction(y: np.ndarray, sr: int, order: int = 16) -> np.ndarray:
     """
-    Applies Warped Linear Prediction (WLP) or standard LPC-based whitening.
-    Report calls for WLP, but standard LPC is a good approximation if warping lib is missing.
-    We implement standard LPC-based whitening as a robust fallback for "spectral whitening".
+    Standard LPC whitening as a proxy.
     """
-    # Standard LPC whitening
-    # 1. Calculate LPC coefficients
     if len(y) < order + 1:
         return y
-
     a = librosa.lpc(y, order=order)
-
-    # 2. Inverse filter (Whitening)
-    # The residue of the prediction filter is the whitened signal
     y_white = scipy.signal.lfilter(a, [1], y)
-
     return y_white
 
-def apply_demucs(audio: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
+def apply_demucs(audio: np.ndarray, sr: int, model_name: str = "htdemucs") -> Dict[str, np.ndarray]:
     """
-    Apply Hybrid Demucs to separate audio into 4 stems: vocals, bass, drums, other.
-    Input: (samples,) mono or stereo.
-    Output: Dict with keys 'vocals', 'bass', 'drums', 'other'.
+    Apply Hybrid Demucs.
     """
-    # Prepare model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        model = pretrained.get_model(DEMUCS_MODEL_NAME)
+        model = pretrained.get_model(model_name)
         model.to(device)
     except Exception as e:
         warnings.warn(f"Failed to load Demucs model: {e}. Returning original mix as stems.")
         return {"vocals": audio, "bass": audio, "drums": audio, "other": audio}
 
-    # Prepare input tensor: (Batch, Channels, Time)
-    # Demucs expects stereo usually. If mono, duplicate channels.
     if audio.ndim == 1:
         audio_stereo = np.stack([audio, audio])
     elif audio.ndim == 2:
-        if audio.shape[0] > 2: # (Time, Channels) -> (Channels, Time)
+        if audio.shape[0] > 2:
              audio_stereo = audio.T
         else:
              audio_stereo = audio
 
-    # Resample to model samplerate if needed (Demucs handles this usually, but good to be safe)
-    # htdemucs is usually 44.1k
     model_sr = model.samplerate
     if sr != model_sr:
         audio_stereo = librosa.resample(audio_stereo, orig_sr=sr, target_sr=model_sr)
@@ -105,20 +69,13 @@ def apply_demucs(audio: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / ref.std()
 
-    # Inference
     with torch.no_grad():
-        # shifts=1, split=True for memory efficiency
         sources = apply_model(model, wav[None], shifts=1, split=True, overlap=0.25, progress=False)[0]
 
-    # De-normalize
     sources = sources * ref.std() + ref.mean()
-
-    # Extract stems
     stems = {}
     source_names = model.sources
     for i, name in enumerate(source_names):
-        # Convert back to mono for downstream processing (as requested by SwiftF0/SACF)
-        # Average the stereo channels
         stem_audio = sources[i].cpu().numpy()
         stem_mono = np.mean(stem_audio, axis=0)
         stems[name] = stem_mono
@@ -127,165 +84,167 @@ def apply_demucs(audio: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
 
 def load_and_preprocess(
     audio_path: str,
-    target_sr: int = 44100, # Defaulting to high quality as per report for Autocorr
-    trim_silence: bool = True,
+    config: StageAConfig = PIANO_61KEY_CONFIG.stage_a,
     fast_mode: bool = False,
 ) -> StageAOutput:
     """
-    Stage A: Robust audio loading, silence trimming, mono conversion, resampling,
-    EBU R128 normalization, Audio Type Classification, and Source Separation.
+    Stage A: Signal Conditioning.
     """
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-    # 1. Load audio with fallback
+    # 1. Load with target sample rate
+    target_sr = config.target_sample_rate
     try:
-        y_orig, sr_orig = librosa.load(audio_path, sr=None, mono=False)
-    except Exception as e:
-        warnings.warn(f"librosa.load failed: {e}. Trying soundfile direct load.")
-        try:
-            y_orig, sr_orig = sf.read(audio_path)
-            if y_orig.ndim == 2:
-                y_orig = y_orig.T  # (channels, samples)
-        except Exception as e2:
-            raise RuntimeError(f"Failed to load audio file {audio_path}: {e2}")
+        y, sr = librosa.load(audio_path, sr=target_sr, mono=False)
+    except Exception:
+        y, sr = sf.read(audio_path)
+        if y.ndim == 2: y = y.T
+        if sr != target_sr:
+            y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+            sr = target_sr
 
-    # Duration Check
-    duration_sec = float(y_orig.shape[-1]) / sr_orig
-    if duration_sec < MIN_DURATION_SEC:
-        raise ValueError(f"Audio too short: {duration_sec:.2f}s. Minimum is {MIN_DURATION_SEC}s.")
-
-    if duration_sec > MAX_DURATION_SEC:
-        warnings.warn(f"Audio too long: {duration_sec:.2f}s. Trimming to {MAX_DURATION_SEC}s.")
-        limit_samples = int(MAX_DURATION_SEC * sr_orig)
-        if y_orig.ndim > 1:
-            y_orig = y_orig[:, :limit_samples]
-        else:
-            y_orig = y_orig[:limit_samples]
-        duration_sec = MAX_DURATION_SEC
-
-    # 2. Downmix to mono for initial analysis and SwiftF0
+    # 2. Channel Handling
     n_channels = 1
-    if y_orig.ndim > 1:
-        n_channels = y_orig.shape[0]
-        y_mono = np.mean(y_orig, axis=0)
+    if y.ndim > 1:
+        n_channels = y.shape[0]
+        if config.channel_handling == "mono_sum":
+            y = np.mean(y, axis=0)
+        elif config.channel_handling == "left_only":
+            y = y[0]
+        elif config.channel_handling == "right_only":
+            y = y[1]
+
+    # Ensure y is 1D from here
+    if y.ndim > 1: y = np.mean(y, axis=0)
+
+    # 3. DC Offset Removal
+    if config.dc_offset_removal:
+        y = y - np.mean(y)
+
+    # 4. Transient Pre-emphasis
+    if config.transient_pre_emphasis.get("enabled", False):
+        alpha = config.transient_pre_emphasis.get("alpha", 0.97)
+        # y[t] = x[t] - alpha * x[t-1]
+        y = scipy.signal.lfilter([1, -alpha], [1], y)
+
+    # 5. High-Pass Filter (Butterworth)
+    # Cutoff: 55Hz, Order: 4
+    cutoff = config.high_pass_filter_cutoff.get("value", 55.0)
+    order = config.high_pass_filter_order.get("value", 4)
+    sos = scipy.signal.butter(order, cutoff, btype='hp', fs=sr, output='sos')
+    y = scipy.signal.sosfilt(sos, y)
+
+    # 6. Silence Trim
+    if config.silence_trimming.get("enabled", True):
+        top_db = config.silence_trimming.get("top_db", 50)
+        y_trimmed, trim_idx = librosa.effects.trim(y, top_db=top_db)
     else:
-        y_mono = y_orig
+        y_trimmed = y
 
-    # 3. Silence Trimming
-    if trim_silence:
-        y_trimmed, trim_idx = librosa.effects.trim(y_mono, top_db=SILENCE_THRESHOLD_DB)
-        # Apply trim to original stereo if needed, but for now we work with mono mostly.
-        # If we need stereo for Demucs, we should trim stereo too.
-        if y_orig.ndim > 1:
-             # Map trim indices
-             y_orig_trimmed = y_orig[:, trim_idx[0]:trim_idx[1]]
-        else:
-             y_orig_trimmed = y_orig[trim_idx[0]:trim_idx[1]]
-    else:
-        y_trimmed = y_mono
-        y_orig_trimmed = y_orig
-
-    # 4. Normalization (EBU R128)
-    # Normalize the mono signal (used for analysis).
-    # For Demucs, we feed the raw (trimmed) audio and it handles norm internally,
-    # but let's normalize y_trimmed for consisten AudioType detection.
-    meter = pyln.Meter(sr_orig)
-    try:
-        # Pyloudnorm requires minimal duration (default block size 0.4s)
-        # If too short, skip loudness measurement
-        if len(y_trimmed) / sr_orig < 0.4:
-             raise ValueError("Audio too short for EBU R128")
-
-        loudness = meter.integrated_loudness(y_trimmed)
-        if not (np.isneginf(loudness) or loudness < -70.0):
-            y_norm = pyln.normalize.loudness(y_trimmed, loudness, TARGET_LUFS)
-            norm_gain = TARGET_LUFS - loudness
-        else:
+    # 7. Loudness Normalization (EBU R128)
+    norm_gain = 0.0
+    if config.loudness_normalization.get("enabled", True):
+        target_lufs = config.loudness_normalization.get("target_lufs", -23.0)
+        meter = pyln.Meter(sr)
+        try:
+            if len(y_trimmed) / sr >= 0.4:
+                loudness = meter.integrated_loudness(y_trimmed)
+                if not (np.isneginf(loudness) or loudness < -70.0):
+                    y_norm = pyln.normalize.loudness(y_trimmed, loudness, target_lufs)
+                    norm_gain = target_lufs - loudness
+                else:
+                    y_norm = y_trimmed
+            else:
+                y_norm = y_trimmed
+        except Exception as e:
+            warnings.warn(f"Loudness norm failed: {e}")
             y_norm = y_trimmed
-            norm_gain = 0.0
-    except Exception as e:
-        warnings.warn(f"Loudness normalization skipped: {e}")
-        y_norm = y_trimmed
-        norm_gain = 0.0
-
-    # 5. Audio Type & Quality Detection
-    audio_type = detect_audio_type(y_norm, sr_orig)
-    print(f"Detected Audio Type: {audio_type}")
-
-    # Extension Check
-    ext = os.path.splitext(audio_path)[1].lower()
-    if ext in ['.wav', '.flac', '.aiff']:
-        audio_quality = AudioQuality.LOSSLESS
-    elif ext in ['.mp3', '.m4a', '.ogg']:
-        audio_quality = AudioQuality.LOSSY
     else:
-        # Default fallback
-        audio_quality = AudioQuality.LOSSLESS
-    print(f"Detected Audio Quality: {audio_quality}")
+        y_norm = y_trimmed
+
+    # 8. Noise Floor Estimation
+    percentile = config.noise_floor_estimation.get("percentile", 30)
+    # Frame RMS
+    frame_len = 2048
+    hop = 1024
+    if len(y_norm) >= frame_len:
+        rms = librosa.feature.rms(y=y_norm, frame_length=frame_len, hop_length=hop)[0]
+        noise_floor_rms = np.percentile(rms, percentile)
+        noise_floor_db = 20 * np.log10(noise_floor_rms + 1e-9)
+    else:
+        noise_floor_rms = 0.0
+        noise_floor_db = -80.0
+
+    # 9. BPM / Beat Grid
+    bpm = None
+    beats = []
+    if config.bpm_detection.get("enabled", True):
+        try:
+            bpm, beat_frames = librosa.beat.beat_track(y=y_norm, sr=sr)
+            beats = librosa.frames_to_time(beat_frames, sr=sr)
+        except Exception:
+            pass
+
+    # 10. Classification & Separation Preparation
+    audio_type = detect_audio_type(y_norm, sr)
+    ext = os.path.splitext(audio_path)[1].lower()
+    quality = AudioQuality.LOSSY if ext in ['.mp3', '.ogg', '.m4a'] else AudioQuality.LOSSLESS
 
     stems_output = {}
 
-    # 6. Branching Logic
-    # Force Monophonic path if Fast Mode
-    if fast_mode:
-        print("Fast Mode enabled: Skipping Demucs, treating as Monophonic mix.")
-        audio_type_to_use = AudioType.MONOPHONIC
+    if fast_mode or audio_type == AudioType.MONOPHONIC:
+        # Skip Demucs
+        stems_output["mix"] = Stem(audio=y_norm, sr=sr, type="mix")
+        # Populate others as needed or just use mix
+        stems_output["vocals"] = Stem(audio=y_norm, sr=sr, type="vocals") # Treat mix as main stem
     else:
-        audio_type_to_use = audio_type
+        # Run Demucs on the PRE-PROCESSED mono (or stereo if we kept it)
+        # WI says "Load with sr...", implies processing on y.
+        # Demucs usually takes stereo. But we did mono sum.
+        # We can feed mono to Demucs (duplicated).
+        # Should we use the TRIMMED/NORMALIZED y? Yes.
 
-    if audio_type_to_use == AudioType.MONOPHONIC:
-        # Path A: Monophonic
-        # Resample to 16kHz for SwiftF0
-        if sr_orig != 16000:
-            y_16k = librosa.resample(y_norm, orig_sr=sr_orig, target_sr=16000)
-        else:
-            y_16k = y_norm
+        # NOTE: Demucs might work better on original raw audio, but WI implies linear flow.
+        # "Normalize signal... so that all detectors downstream behave predictably"
+        # Since Separation is Stage B in WI?
+        # WI says "2.1 Stage A ... Return y (processed)".
+        # "2.2 Stage B ... Source Separation".
+        # So Separation logic should be in Stage B, but typically we do it before detectors.
+        # My plan said "Refactor Stage A ... Return StageAOutput".
+        # Current Stage A included Separation.
+        # WI structure: "2.1 Stage A" returns y. "2.2 Stage B" does separation.
+        # I will move separation to Stage B strictly.
 
-        stems_output["vocals"] = Stem(audio=y_16k, sr=16000, type="vocals")
-        # Provide others as empty or copies?
-        # Ideally, we just provide the main one.
+        # So Stage A just returns the conditioned mix.
+        stems_output["mix"] = Stem(audio=y_norm, sr=sr, type="mix")
 
-    else:
-        # Path B: Polyphonic (Demucs)
-        print("Starting Source Separation (Demucs)...")
-        # Use y_orig_trimmed (stereo if avail) for Demucs for best results
-        demucs_stems = apply_demucs(y_orig_trimmed, sr_orig)
-
-        # Process Stems
-        # Vocals & Bass -> 16kHz (for SwiftF0)
-        for name in ["vocals", "bass"]:
-            s = demucs_stems[name]
-            s_16k = librosa.resample(s, orig_sr=44100, target_sr=16000) # Demucs usually outputs 44.1k
-            stems_output[name] = Stem(audio=s_16k, sr=16000, type=name)
-
-        # Other -> 44.1kHz + Whitening (for SACF)
-        other = demucs_stems["other"]
-        # Whitening
-        other_white = warped_linear_prediction(other, sr=44100)
-        stems_output["other"] = Stem(audio=other_white, sr=44100, type="other")
-
-        # Drums -> Keep raw or discard? Keep for reference.
-        stems_output["drums"] = Stem(audio=demucs_stems["drums"], sr=44100, type="drums")
-
-    # Meta Data Construction
     meta = MetaData(
-        original_sr=sr_orig,
+        original_sr=sr,
         target_sr=target_sr,
-        sample_rate=target_sr, # Global target
-        duration_sec=len(y_norm) / sr_orig, # Use trimmed/processed duration
-        window_size=1024,
-        hop_length=256,
-        time_signature="4/4",
-        tempo_bpm=None,
-        lufs=TARGET_LUFS,
+        sample_rate=target_sr,
+        duration_sec=len(y_norm) / sr,
+        window_size=2048,
+        hop_length=512, # Standard? WI mentions 160 for vocals, detector specific.
+                        # Global hop?
+                        # WI: "All detectors must produce F0 at the same hop size".
+                        # Let's set a global hop, e.g. 256 or 512.
+        tempo_bpm=bpm,
+        lufs=config.loudness_normalization.get("target_lufs", -23),
         processing_mode=audio_type.value,
         audio_type=audio_type,
-        audio_quality=audio_quality,
+        audio_quality=quality,
         audio_path=audio_path,
         n_channels=n_channels,
         normalization_gain_db=norm_gain,
         rms_db=20 * np.log10(np.sqrt(np.mean(y_norm**2))) if len(y_norm) > 0 else -80
     )
+
+    # Store noise floor in meta for Stage C/D use? Or just in analysis data.
+    # MetaData doesn't have noise_floor field.
+    # But Stage A returns it.
+
+    # I will attach beat times to analysis object later, or put in MetaData if I add a field.
+    # MetaData has `beats` (added in Models).
 
     return StageAOutput(stems=stems_output, meta=meta, audio_type=audio_type)

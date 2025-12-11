@@ -6,8 +6,19 @@ import torch.nn as nn
 import os
 import warnings
 import music21
-from typing import Optional, Tuple, List, Union, Dict, Set
+from typing import Optional, Tuple, List, Union, Dict, Set, Any
 from collections import defaultdict
+
+# Optional dependencies
+try:
+    import crepe
+except ImportError:
+    crepe = None
+
+try:
+    from rmvpe import RMVPE
+except ImportError:
+    RMVPE = None
 
 def midi_to_hz(midi: float) -> float:
     return 440.0 * (2.0 ** ((midi - 69.0) / 12.0))
@@ -28,6 +39,7 @@ class BasePitchDetector:
 
 class YinDetector(BasePitchDetector):
     def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        # Using librosa.pyin as a proxy for YIN/pYIN
         f0, voiced_flag, voiced_probs = librosa.pyin(
             y,
             fmin=self.fmin,
@@ -179,45 +191,6 @@ class SACFDetector(BasePitchDetector):
 
         return f0_out, conf_out
 
-    def validate(self, f0_candidate: float, y_resid: np.ndarray, threshold: float = 0.3) -> bool:
-        """
-        Validates if f0_candidate exists in y_resid using SACF.
-        Since ISS calls this in a loop, ideally we would cache SACF of y_resid,
-        but y_resid changes every iteration! So we must recompute.
-        However, for efficiency, maybe we only compute for the relevant frequency?
-        No, SACF is global.
-        Recomputing SACF for full signal every note peel is expensive but required for correctness
-        as removing energy changes the correlation structure.
-        For optimization, we could compute only around the lag of interest, but FFT does all.
-        """
-        # We need to validate if there is a peak at f0_candidate
-        if f0_candidate <= 0: return False
-
-        # We can't easily run on full signal and check every frame.
-        # The Consensus Model usually works frame-wise or on the summary of the whole clip?
-        # "SACF checks for a periodicity peak at that candidate's frequency."
-        # Usually this means checking if the global SACF (averaged over time) has a peak,
-        # OR if we are doing frame-wise ISS, we check local SACF.
-        # But `iterative_spectral_subtraction` in stage_b.py works on the FULL signal to extract curves.
-        # It calls `detector.predict(y_resid)`.
-        # So `predict` returns a CURVE.
-        # The Consensus logic implies:
-        # 1. SwiftF0 proposes a CURVE (f0_curve).
-        # 2. SACF validates this CURVE.
-
-        # Implementation:
-        # Check if SACF has peaks matching the f0_curve in most frames where confidence is high.
-        # Since we don't have the curve here (only single float in signature?),
-        # Wait, the signature I proposed in plan was `validate(f0_candidate)`.
-        # If f0_candidate is a scalar, it's for a single frame.
-        # If it's a curve (array), it's for the whole clip.
-
-        # Let's assume f0_candidate is the CURVE (np.ndarray) because ISS works on curves.
-        pass
-        # See actual implementation below in a method that supports the ISS loop in stage_b.py.
-        # But here I am defining the class.
-        # I'll update the signature to accept np.ndarray.
-
     def validate_curve(self, f0_curve: np.ndarray, y_resid: np.ndarray, threshold: float = 0.2) -> float:
         """
         Validates a pitch trajectory against the signal's SACF.
@@ -242,9 +215,6 @@ class SACFDetector(BasePitchDetector):
                 continue
 
             # Check peak at lag_idx (allow +/- 1 wiggle)
-            # The SACF map is 0-indexed relative to 0 lag? No, it's relative to 0.
-            # sacf indices are raw lags.
-
             if lag_idx >= sacf.shape[0]: continue
 
             # Get value at lag
@@ -351,19 +321,9 @@ class SwiftF0Detector(BasePitchDetector):
                     all_notes = []
 
                     if len(score.parts) > 0:
-                        # For polyphonic mock, we might need all parts or just flatten everything
-                        # If "Other" stem, we definitely want chords or accompaniment.
-                        # But for "Vocals", we want melody.
-                        # The mock doesn't know which stem it's processing!
-                        # But typically we use SwiftF0 for Vocals (Monophonic) and Other (Polyphonic).
-                        # If Monophonic, we just take the top note?
-                        # If Polyphonic (Mock State), we take the next available note.
                         notes = score.flat.notes
                     else:
                         notes = score.flat.notes
-
-                    # Pre-process notes into a list of (start, end, pitch)
-                    # to avoid repeated music21 iteration
 
                     bpm = 120.0
                     mm = score.flat.getElementsByClass('MetronomeMark')
@@ -400,17 +360,13 @@ class SwiftF0Detector(BasePitchDetector):
                         candidates = frame_notes[i]
                         if not candidates: continue
 
-                        # Sort candidates (e.g., by pitch, or energy if we had it)
-                        # Let's sort by pitch descending (Melody usually highest)
-                        # But for ISS peeling, we might peel bass to treble or vice versa.
-                        # Sorted: Lowest to Highest
+                        # Sort candidates Lowest to Highest
                         candidates.sort()
 
                         # Find first candidate NOT in _mock_state[i]
                         selected = None
                         for p in candidates:
                             # Fuzzy match for state (float precision)
-                            # Check if any detected pitch is close to p
                             already_detected = False
                             for dp in self._mock_state[i]:
                                 if abs(dp - p) < 1.0: # 1Hz tolerance
@@ -433,8 +389,6 @@ class SwiftF0Detector(BasePitchDetector):
                             # Mark as detected
                             self._mock_state[i].add(selected)
                         else:
-                            # All candidates peeled?
-                            # Return silence
                             pass
 
                     return f0_out, conf_out
@@ -445,4 +399,83 @@ class SwiftF0Detector(BasePitchDetector):
 
             return np.zeros(n_frames), np.zeros(n_frames)
 
+        # Real Inference (Placeholder as model weights not strictly required for this task if mocked)
+        # But if weights present, it runs forward.
+        with torch.no_grad():
+             # Implement real inference framing if needed, but keeping mock logic as primary per context
+             pass
+
         return np.zeros(n_frames), np.zeros(n_frames)
+
+
+class CREPEDetector(BasePitchDetector):
+    def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float, model_capacity: str = "full", use_viterbi: bool = False):
+        super().__init__(sr, hop_length, fmin, fmax)
+        self.model_capacity = model_capacity
+        self.use_viterbi = use_viterbi
+
+    def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        if crepe is None:
+            warnings.warn("CREPE not installed. Returning empty.")
+            n_frames = (len(y) - 1024) // self.hop_length + 1 # Approx
+            if n_frames < 0: n_frames = 0
+            return np.zeros(n_frames), np.zeros(n_frames)
+
+        try:
+            # Crepe handles its own framing, but we need to match ours.
+            # Crepe's step_size is in ms.
+            step_size_ms = (self.hop_length / self.sr) * 1000.0
+
+            time, frequency, confidence, activation = crepe.predict(
+                y,
+                sr=self.sr,
+                viterbi=self.use_viterbi,
+                step_size=step_size_ms,
+                model_capacity=self.model_capacity,
+                verbose=0
+            )
+
+            # Re-interpolate to our exact grid if needed, but usually it matches step_size
+            return frequency, confidence
+        except Exception as e:
+            warnings.warn(f"CREPE failed: {e}")
+            n_frames = (len(y) - 1024) // self.hop_length + 1
+            return np.zeros(n_frames), np.zeros(n_frames)
+
+
+class RMVPEDetector(BasePitchDetector):
+    def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float, silence_threshold: float = 0.04):
+        super().__init__(sr, hop_length, fmin, fmax)
+        self.silence_threshold = silence_threshold
+        self.model = None
+        if RMVPE is not None:
+             # Assume RMVPE needs a model path
+             model_path = os.getenv("RMVPE_PATH", "assets/rmvpe.pt")
+             if os.path.exists(model_path):
+                 self.model = RMVPE(model_path, device="cuda" if torch.cuda.is_available() else "cpu", is_half=False)
+
+    def predict(self, y: np.ndarray, audio_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+        if self.model is None:
+            warnings.warn("RMVPE not available or model not found.")
+            n_frames = (len(y) - 1024) // self.hop_length + 1
+            return np.zeros(n_frames), np.zeros(n_frames)
+
+        try:
+             # RMVPE typically expects specific input, wrapper implementation depends on library
+             f0 = self.model.infer_from_audio(y, self.sr)
+             # f0 might not match our hop length
+             # Interpolate to match
+             target_frames = (len(y) // self.hop_length) + 1
+             current_indices = np.linspace(0, target_frames, len(f0))
+             target_indices = np.arange(target_frames)
+             f0_interp = np.interp(target_indices, current_indices, f0)
+
+             # Create fake confidence based on silence/voicing or return 1.0 where voiced
+             conf_interp = np.where(f0_interp > 0, 0.9, 0.0)
+
+             return f0_interp, conf_interp
+
+        except Exception as e:
+            warnings.warn(f"RMVPE failed: {e}")
+            n_frames = (len(y) - 1024) // self.hop_length + 1
+            return np.zeros(n_frames), np.zeros(n_frames)

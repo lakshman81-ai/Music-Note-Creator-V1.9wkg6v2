@@ -1,165 +1,178 @@
 from typing import List, Optional
 import numpy as np
-from music21 import stream, note, tempo, meter, key, dynamics, articulations
+import music21
+from music21 import stream, note, chord, tie, tempo, meter, key, dynamics, articulations, layout, clef
 from .models import NoteEvent, AnalysisData
+from .config import PIANO_61KEY_CONFIG, PipelineConfig
 
 def quantize_and_render(
-    events: List[NoteEvent], # These are already quantized in Stage C, but we do final formatting here
+    events: List[NoteEvent], # These are the notes from Stage C
     analysis_data: AnalysisData,
+    config: PipelineConfig = PIANO_61KEY_CONFIG,
 ) -> str:
     """
-    Stage D: Render Sheet Music (MusicXML/MIDI)
+    Stage D: Render Sheet Music (MusicXML) using music21.
     """
-    # 1. Setup global context
+    d_conf = config.stage_d
     bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else 120.0
     ts_str = analysis_data.meta.time_signature if analysis_data.meta.time_signature else "4/4"
+    split_pitch = d_conf.staff_split_point.get("pitch", 60) # C4
 
-    # Gap Merging
-    # "Gap merging for notes separated by < 1/32 note"
-    # 1/32 note = 1/8 beat = 0.125
-    gap_threshold_beats = 0.125
-
-    merged_events = []
-    if events:
-        events.sort(key=lambda x: x.start_sec)
-        current_note = events[0]
-
-        for i in range(1, len(events)):
-            next_note = events[i]
-
-            # Calculate gap in beats
-            # We need to rely on the quantized start/end from Stage C
-            # but Stage C updated .start_sec and .end_sec to match grid.
-            # So we can compare seconds or beats.
-
-            gap_sec = next_note.start_sec - current_note.end_sec
-            quarter_sec = 60.0 / bpm
-            gap_beats = gap_sec / quarter_sec
-
-            # Check overlap? "No overlapping same-pitch notes"
-            if next_note.midi_note == current_note.midi_note:
-                # Only merge if gap is small BUT NOT ZERO.
-                # Zero gap (touching) implies intentional repeated notes (quantized).
-                if 0 < gap_beats < gap_threshold_beats:
-                    # Merge
-                    current_note.end_sec = next_note.end_sec
-                    # Update duration beats
-                    if current_note.duration_beats is None:
-                         current_note.duration_beats = 0.0
-                    if next_note.duration_beats is None:
-                         next_note.duration_beats = 0.0
-
-                    current_note.duration_beats += next_note.duration_beats + gap_beats
-                    # Recalculate duration beats from seconds to be safe?
-                    # duration_beats = (end - start) / quarter_sec
-                    current_note.duration_beats = (current_note.end_sec - current_note.start_sec) / quarter_sec
-                else:
-                    merged_events.append(current_note)
-                    current_note = next_note
-            else:
-                merged_events.append(current_note)
-                current_note = next_note
-        merged_events.append(current_note)
-
-    # 2. Velocity Mapping
-    # v = 20 + 85 * clamp((rms_dB – rms_min)/(rms_max – rms_min), 0, 1)
-    # rms_min = -40 dB, rms_max = -4 dB
-
-    rms_min = -40.0
-    rms_max = -4.0
-
-    final_notes_for_xml = []
-
-    for e in merged_events:
-        # Calculate dB
-        if e.rms_value <= 0:
-            val_db = -80.0
-        else:
-            val_db = 20 * np.log10(e.rms_value)
-
-        # Clamp
-        clamped = max(rms_min, min(rms_max, val_db))
-        ratio = (clamped - rms_min) / (rms_max - rms_min)
-
-        v = 20 + 85 * ratio
-        midi_vel = int(round(v))
-        e.velocity = midi_vel / 127.0
-
-        final_notes_for_xml.append((e, midi_vel))
-
-    # 3. Render MusicXML
+    # 1. Setup Score
     s = stream.Score()
-    p = stream.Part()
 
-    # Metadata
-    m1 = stream.Measure()
-    m1.number = 1
+    # Create Parts
+    part_treble = stream.Part()
+    part_treble.id = 'P1'
+    part_bass = stream.Part()
+    part_bass.id = 'P2'
 
-    try:
-        ts_obj = meter.TimeSignature(ts_str)
-    except:
-        ts_obj = meter.TimeSignature("4/4")
+    # Metadata / Measure 1 setup
+    # We insert into flat parts, music21 handles measure creation.
+    # But to ensure correct Key/Time/Tempo at start:
 
-    m1.timeSignature = ts_obj
-    m1.append(tempo.MetronomeMark(number=bpm))
+    # Add Clefs? Music21 might auto-detect, but we force Treble/Bass
+    part_treble.append(clef.TrebleClef())
+    part_bass.append(clef.BassClef())
 
+    # Add TimeSignature
+    ts_obj = meter.TimeSignature(ts_str)
+    part_treble.append(ts_obj)
+    part_bass.append(ts_obj)
+
+    # Add Tempo
+    mm = tempo.MetronomeMark(number=bpm)
+    part_treble.append(mm)
+    part_bass.append(mm) # Optional to duplicate
+
+    # Add Key
     if analysis_data.meta.detected_key:
         try:
-            m1.append(key.Key(analysis_data.meta.detected_key))
+            k = key.Key(analysis_data.meta.detected_key)
+            part_treble.append(k)
+            part_bass.append(k)
         except:
             pass
 
-    p.append(m1)
+    # 2. Process Notes & Chords
+    # WI Rules:
+    # - Staff split
+    # - Durations & divisions
+    # - Chords (same onset)
+    # - Ties (handled by music21 makeMeasures usually, but we might need explicit)
+    # - Velocity/Dynamics
+    # - Staccato
 
-    # We need to insert notes at specific offsets.
-    # Music21 handles measures if we use .makeMeasures() or we insert into a flat stream and then make measures.
-    # Inserting into flat stream is easier.
+    # Group by onset to identify chords
+    # Key: (start_sec, staff_idx) -> List[NoteEvent]
+    # We first assign staff to events based on pitch
 
-    for e, vel in final_notes_for_xml:
-        if e.midi_note is None: continue
+    sorted_events = sorted(events, key=lambda e: e.start_sec)
 
-        n = note.Note(e.midi_note)
-        if e.duration_beats and e.duration_beats > 0:
-            n.quarterLength = e.duration_beats
+    # Grouping
+    # We use a tolerance for "simultaneous"
+    onset_tol = 0.05 # 50ms
+
+    groups = []
+    if sorted_events:
+        current_group = [sorted_events[0]]
+        for i in range(1, len(sorted_events)):
+            e = sorted_events[i]
+            if e.start_sec - current_group[0].start_sec < onset_tol:
+                current_group.append(e)
+            else:
+                groups.append(current_group)
+                current_group = [e]
+        groups.append(current_group)
+
+    import music21.chord
+    import music21.note
+
+    # Helper to create m21 object
+    def create_m21_obj(group: List[NoteEvent]):
+        # Calculate duration in Quarter Lengths (beats)
+        # We assume all in group have roughly same duration?
+        # Use max duration? Or individual?
+        # Music21 Chords have single duration.
+        # If polyphonic with different durations, we need different Voices.
+        # For simplicity (WI "Chords"), we assume block chords if onsets match.
+        # We take the max duration of the group.
+
+        start = group[0].start_sec
+        # Determine duration
+        max_end = max(e.end_sec for e in group)
+        dur_sec = max_end - start
+        quarter_dur = 60.0 / bpm
+        q_len = dur_sec / quarter_dur
+
+        # Quantize q_len to nearest 1/16th (0.25)
+        # divisions_per_quarter usually handles display, but q_len is float.
+        # Round to nearest 0.25
+        q_len = round(q_len * 4) / 4.0
+        if q_len == 0: q_len = 0.25 # Minimum
+
+        velocity = int(np.mean([e.velocity for e in group]) * 127)
+
+        if len(group) > 1:
+            # Chord
+            pitches = [e.midi_note for e in group]
+            # Remove duplicates
+            pitches = sorted(list(set(pitches)))
+            m21_obj = music21.chord.Chord(pitches)
         else:
-            n.quarterLength = 0.25 # Default fallback
+            # Note
+            m21_obj = music21.note.Note(group[0].midi_note)
 
-        n.volume.velocity = vel
+        m21_obj.quarterLength = q_len
+        m21_obj.volume.velocity = velocity
 
-        # Staccato check
-        # "Durations < 30 ticks -> staccato notation"
-        # 30 ticks = 1/16th note = 0.25 beats
-        if n.quarterLength < 0.25:
-             n.articulations.append(articulations.Staccato())
+        # Staccato
+        staccato_thresh = d_conf.staccato_marking.get("threshold_beats", 0.25)
+        if q_len < staccato_thresh:
+            m21_obj.articulations.append(articulations.Staccato())
 
-        # Insert at absolute beat position
-        # Stage C calculated `measure` and `beat`.
-        # Absolute beat = (measure - 1) * 4 + (beat - 1) (assuming 4/4)
-        # Better to rely on `start_sec` converted to beats
+        return m21_obj, start
 
-        abs_beat = (e.start_sec / (60.0/bpm))
-        p.insert(abs_beat, n)
+    # Insert into Stream
+    for group in groups:
+        # Split group by staff
+        treble_notes = [e for e in group if e.midi_note >= split_pitch]
+        bass_notes = [e for e in group if e.midi_note < split_pitch]
 
-    # Make measures
+        if treble_notes:
+            obj, start = create_m21_obj(treble_notes)
+            # Convert start time to beat offset
+            offset = (start * bpm / 60.0)
+            part_treble.insert(offset, obj)
+
+        if bass_notes:
+            obj, start = create_m21_obj(bass_notes)
+            offset = (start * bpm / 60.0)
+            part_bass.insert(offset, obj)
+
+    s.append(part_treble)
+    s.append(part_bass)
+
+    # 3. Make Measures & Ties
+    # music21.makeMeasures() automatically handles:
+    # - Bar lines
+    # - Tying notes that cross measures
+    # - Filling rests? (best effort)
+
     try:
-        s.append(p)
-        s = s.makeMeasures()
+        s_quant = s.makeMeasures()
+        # makeTies logic is implicitly handled if we inserted duration > measure_len?
+        # Usually makeMeasures splits notes.
+        # We might need to run makeTies explicitly if we constructed raw.
+        s_quant.makeTies(inPlace=True)
     except Exception as e:
-        print(f"makeMeasures failed: {e}")
+        print(f"Quantization failed: {e}")
+        s_quant = s # Fallback
 
-    # Export
+    # 4. Export
     from music21.musicxml import m21ToXml
-    exporter = m21ToXml.GeneralObjectExporter(s)
+    exporter = m21ToXml.GeneralObjectExporter(s_quant)
     musicxml_bytes = exporter.parse()
     musicxml_str = musicxml_bytes.decode('utf-8')
-
-    # Update Layout
-    if analysis_data.vexflow_layout:
-         try:
-             # Just count measures for basic layout
-             measures = s.parts[0].getElementsByClass(stream.Measure)
-             analysis_data.vexflow_layout.measures = [{"index": m.number} for m in measures]
-         except:
-             analysis_data.vexflow_layout.measures = []
 
     return musicxml_str
