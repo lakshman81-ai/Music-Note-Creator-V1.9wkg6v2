@@ -8,48 +8,42 @@ from dataclasses import dataclass, field
 
 @dataclass
 class StageAConfig:
-    # Global target sample rate (aligned with synth + debug fix)
     target_sample_rate: int = 44100
-
-    # Channel handling: "mono_sum", "left_only", "right_only"
-    channel_handling: str = "mono_sum"
-
-    # DC offset removal
+    channel_handling: str = "mono_sum"  # "mono_sum", "left_only", "right_only"
     dc_offset_removal: bool = True
-
-    # Transient pre-emphasis (hammer attacks)
-    # y[t] = x[t] - alpha * x[t-1]
     transient_pre_emphasis: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True, "alpha": 0.97}
     )
-
-    # High-pass filter (Butterworth) for rumble removal
     high_pass_filter_cutoff: Dict[str, Any] = field(
         default_factory=lambda: {"value": 55.0}
     )
     high_pass_filter_order: Dict[str, Any] = field(
         default_factory=lambda: {"value": 4}
     )
-
-    # Silence trimming (keep long piano tails)
     silence_trimming: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True, "top_db": 50}
     )
-
-    # Loudness normalization (EBU R128 to –23 LUFS)
     loudness_normalization: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True, "target_lufs": -23.0}
+    )
+
+    # Peak limiter (Soft clip or -1 dB ceiling)
+    peak_limiter: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,          # set True to use it
+            "mode": "soft",            # "soft" | "hard"
+            "ceiling_db": -1.0,        # max peak level
+        }
     )
 
     # Noise floor estimation (percentile of RMS)
     noise_floor_estimation: Dict[str, Any] = field(
         default_factory=lambda: {"percentile": 30}
     )
-
-    # BPM / beat detection
     bpm_detection: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True}
     )
+
 
 
 # ------------------------------------------------------------
