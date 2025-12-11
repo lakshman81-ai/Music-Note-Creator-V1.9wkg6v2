@@ -6,12 +6,6 @@ from enum import Enum
 import numpy as np
 
 
-PitchName = Literal[
-    "C", "C#", "D", "D#", "E", "F",
-    "F#", "G", "G#", "A", "A#", "B"
-]
-
-
 class AudioType(str, Enum):
     MONOPHONIC = "monophonic"
     POLYPHONIC_DOMINANT = "polyphonic_dominant"
@@ -42,7 +36,7 @@ class MetaData:
     window_size: int = 2048                 # analysis window size
     hop_length: int = 512                   # analysis hop length
     sample_rate: int = 44100                # effective working SR
-    tempo_bpm: Optional[float] = 120.0      # global tempo estimate
+    tempo_bpm: Optional[float] = 120.0      # global tempo estimate (assumed default if not detected)
     time_signature: str = "4/4"             # default, can be refined
 
     # Original IO info
@@ -93,7 +87,7 @@ class StageBOutput:
     f0_layers: List[np.ndarray]             # Polyphonic layers
     # per_detector[stem_name][det_name] = (f0_array, conf_array)
     per_detector: Dict[str, Any]
-    stem_timelines: Dict[str, List[FramePitch]] = field(default_factory=dict)
+    stem_timelines: Dict[str, List["FramePitch"]] = field(default_factory=dict)
     meta: Optional[MetaData] = None         # Passed through from Stage A
 
 
@@ -131,7 +125,7 @@ class NoteEvent:
     confidence: float = 0.0
 
     # Performance-ish info
-    velocity: float = 0.8                   # 0–1 (later mapped to MIDI 0–127)
+    velocity: float = 0.8                   # normalized 0.0–1.0, NOT MIDI 0–127
     rms_value: float = 0.0                  # Raw RMS energy (linear)
     is_grace: bool = False
     dynamic: str = "mf"                     # "p", "mf", "f", etc.
@@ -237,6 +231,21 @@ class AnalysisData:
             ],
             "vexflow_layout": self.vexflow_layout.measures,
             "beats": self.beats,
+
+            # Extended / diagnostic fields
+            "stem_timelines": {
+                stem: [asdict(f) for f in frames]
+                for stem, frames in self.stem_timelines.items()
+            },
+            "stem_onsets": self.stem_onsets,
+            "onsets": self.onsets,
+            "pitch_tracker": self.pitch_tracker,
+            "n_frames": self.n_frames,
+            "frame_hop_seconds": self.frame_hop_seconds,
+            "notes_before_quantization": [
+                asdict(e) for e in self.notes_before_quantization
+            ],
+            "benchmark": asdict(self.benchmark) if self.benchmark else None,
         }
 
 
@@ -248,12 +257,22 @@ class TranscriptionResult:
 
     def __getitem__(self, key):
         """Allow dict-like access for compatibility."""
+        # Direct attributes on this object
         if hasattr(self, key):
             return getattr(self, key)
+
+        # Delegate common analysis_data keys
         if key == "meta":
             return self.analysis_data.meta
         if key == "notes":
             return self.analysis_data.notes
+        if key == "timeline":
+            return self.analysis_data.timeline
+        if key == "chords":
+            return self.analysis_data.chords
+        if key == "beats":
+            return self.analysis_data.beats
+
         raise KeyError(key)
 
     def get(self, key, default=None):
