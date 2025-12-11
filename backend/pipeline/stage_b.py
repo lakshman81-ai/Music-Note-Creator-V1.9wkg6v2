@@ -56,7 +56,6 @@ def create_harmonic_mask(
     width: fractional bandwidth around each harmonic (e.g. 0.03 = ±3%).
     """
     n_freqs, n_frames = stft.shape
-    # n_fft = 2 * (n_freqs - 1)  # inverse of mag shape
     fft_freqs = librosa.fft_frequencies(sr=sr, n_fft=(n_freqs - 1) * 2)
     mask = np.zeros_like(stft, dtype=np.float32)
 
@@ -78,7 +77,8 @@ def create_harmonic_mask(
             idx_end = np.searchsorted(fft_freqs, f_high)
             idx_start = max(0, idx_start)
             idx_end = min(n_freqs, idx_end)
-            mask[idx_start:idx_end, t] = 1.0
+            if idx_start < idx_end:
+                mask[idx_start:idx_end, t] = 1.0
 
     return mask
 
@@ -119,7 +119,9 @@ def iterative_spectral_subtraction(
             break
 
         # 2) Validation
-        validation_score = validator_detector.validate_curve(f0, y_resid, threshold=0.2)
+        validation_score = validator_detector.validate_curve(
+            f0, y_resid, threshold=0.2
+        )
         if validation_score < 0.2 and len(extracted) > 0:
             # Only stop early if we already have at least one good layer
             break
@@ -130,7 +132,9 @@ def iterative_spectral_subtraction(
         S = librosa.stft(y_resid, n_fft=n_fft, hop_length=hop_length)
         mask = create_harmonic_mask(S, f0, sr, width=mask_width)
         S_clean = S * (1.0 - mask)
-        y_resid = librosa.istft(S_clean, hop_length=hop_length, length=len(y_resid))
+        y_resid = librosa.istft(
+            S_clean, hop_length=hop_length, length=len(y_resid)
+        )
 
     return extracted
 
@@ -150,7 +154,7 @@ def extract_features(
     - 2.2.1: Source separation (HTDemucs) to get piano-focused stems.
     - 2.2.2: Instrument profiles (SwiftF0/RMVPE/CREPE/YIN/SACF/CQT).
     - 2.2.3: Ensemble logic with SwiftF0 priority and disagreement threshold.
-    - Piano: ISS-based polyphonic peeling for up to 8 layers.
+    - Piano: ISS-based polyphonic peeling for up to N layers.
     - Output: StageBOutput with time_grid, f0_main, f0_layers, per_detector, stem_timelines.
     """
     sb_config: StageBConfig = config.stage_b
@@ -166,7 +170,11 @@ def extract_features(
 
     if sb_config.separation.get("enabled", True) and mix_stem is not None:
         # Run Demucs on the conditioned mix
-        demucs_stems = apply_demucs(mix_stem.audio, mix_stem.sr, model_name=sb_config.separation.get("model", "htdemucs"))
+        demucs_stems = apply_demucs(
+            mix_stem.audio,
+            mix_stem.sr,
+            model_name=sb_config.separation.get("model", "htdemucs"),
+        )
 
         # Map Demucs outputs to Stem objects
         for name, audio in demucs_stems.items():
@@ -180,11 +188,15 @@ def extract_features(
     # --------------------------------------------------------
     global_sr = meta.sample_rate
     global_hop = meta.hop_length
+
+    # Guard: if hop_length accidentally zero, fall back to 512
+    if global_hop <= 0:
+        global_hop = 512
+
     duration_sec = float(meta.duration_sec)
 
     if duration_sec <= 0.0:
         # Fallback if meta.duration_sec is missing
-        # Use "mix" stem length if available
         if mix_stem is not None:
             duration_sec = len(mix_stem.audio) / float(mix_stem.sr)
         else:
@@ -252,7 +264,27 @@ def extract_features(
         if stem.sr != global_sr:
             audio = librosa.resample(audio, orig_sr=stem.sr, target_sr=global_sr)
 
-        # Instantiate detectors according to config + profile
+        # ----------------------------------------------------
+        # 4.0 Precompute per-frame RMS for this stem
+        # ----------------------------------------------------
+        # This feeds into Stage C via FramePitch.rms → NoteEvent.rms_value
+        # and then velocity mapping (min_db / max_db).
+        frame_rms = librosa.feature.rms(
+            y=audio,
+            frame_length=2048,
+            hop_length=global_hop,
+        )[0]  # shape: (n_frames_rms,)
+
+        if len(frame_rms) != n_frames_global:
+            if len(frame_rms) > n_frames_global:
+                frame_rms = frame_rms[:n_frames_global]
+            else:
+                pad = n_frames_global - len(frame_rms)
+                frame_rms = np.pad(frame_rms, (0, pad))
+
+        # ----------------------------------------------------
+        # 4.1 Instantiate detectors according to config/profile
+        # ----------------------------------------------------
         detectors: List[Tuple[str, Any]] = []
 
         def add_det(cls, name: str, **kwargs):
@@ -268,7 +300,6 @@ def extract_features(
             except Exception as e:
                 print(f"[Stage B] Failed to init {name} for stem '{stem_name}': {e}")
 
-        # Detector enable flags
         dconf = sb_config.detectors
 
         # SwiftF0
@@ -290,22 +321,31 @@ def extract_features(
         # RMVPE (if recommended or globally enabled)
         if profile.recommended_algo == "rmvpe" or dconf.get("rmvpe", {}).get("enabled", False):
             rm_conf = dconf.get("rmvpe", {})
-            sil_thresh = profile.special.get("silence_threshold", rm_conf.get("silence_threshold", 0.04))
+            sil_thresh = profile.special.get(
+                "silence_threshold", rm_conf.get("silence_threshold", 0.04)
+            )
             add_det(RMVPEDetector, "rmvpe", silence_threshold=sil_thresh)
 
         # CREPE (if recommended or globally enabled)
         if profile.recommended_algo == "crepe" or dconf.get("crepe", {}).get("enabled", False):
             cr_conf = dconf.get("crepe", {})
-            viterbi = profile.special.get("viterbi", cr_conf.get("use_viterbi", False))
+            viterbi = profile.special.get(
+                "viterbi", cr_conf.get("use_viterbi", False)
+            )
             model_capacity = cr_conf.get("model_capacity", "full")
-            add_det(CREPEDetector, "crepe", model_capacity=model_capacity, use_viterbi=viterbi)
+            add_det(
+                CREPEDetector,
+                "crepe",
+                model_capacity=model_capacity,
+                use_viterbi=viterbi,
+            )
 
         # If no detectors, skip stem
         if not detectors:
             continue
 
         # --------------------------------------------
-        # 4.1 Run All Detectors for This Stem
+        # 4.2 Run All Detectors for This Stem
         # --------------------------------------------
         candidates_per_frame: List[List[Dict[str, float]]] = [
             [] for _ in range(n_frames_global)
@@ -343,7 +383,7 @@ def extract_features(
         per_detector_results[stem_name] = stem_raw_results
 
         # --------------------------------------------
-        # 4.2 Ensemble Logic (Monophonic main track)
+        # 4.3 Ensemble Logic (Monophonic main track)
         # --------------------------------------------
         weights = sb_config.ensemble_weights
         priority_floor = sb_config.confidence_priority_floor
@@ -406,7 +446,7 @@ def extract_features(
             stem_conf[i] = final_conf
 
         # --------------------------------------------
-        # 4.3 Ensemble Smoothing (per instrument)
+        # 4.4 Ensemble Smoothing (per instrument)
         # --------------------------------------------
         kernel = int(profile.special.get("ensemble_smoothing_frames", 3))
         if kernel > 1 and kernel % 2 == 1:
@@ -414,10 +454,14 @@ def extract_features(
             stem_f0 = scipy.signal.medfilt(stem_f0, kernel_size=kernel)
 
         # --------------------------------------------
-        # 4.4 Polyphonic Peeling for Piano (ISS)
+        # 4.5 Polyphonic Peeling for Piano (ISS)
         # --------------------------------------------
         stem_layers: List[np.ndarray] = []
-        if profile.instrument == "piano_61key" and primary_det is not None and validator_det is not None:
+        if (
+            profile.instrument == "piano_61key"
+            and primary_det is not None
+            and validator_det is not None
+        ):
             if hasattr(primary_det, "reset_state"):
                 primary_det.reset_state()
 
@@ -444,14 +488,14 @@ def extract_features(
                 stem_conf = main_conf
 
                 # Remaining layers as polyphony
-                for (lf0, lconf) in extracted[1:]:
+                for (lf0, _lconf) in extracted[1:]:
                     if len(lf0) != n_frames_global:
                         pad2 = n_frames_global - len(lf0)
                         lf0 = np.pad(lf0, (0, max(0, pad2)))[:n_frames_global]
                     stem_layers.append(lf0)
 
         # --------------------------------------------
-        # 4.5 Build FramePitch timeline for this stem
+        # 4.6 Build FramePitch timeline for this stem
         # --------------------------------------------
         timeline: List[FramePitch] = []
         for i in range(n_frames_global):
@@ -476,13 +520,15 @@ def extract_features(
                 main_conf = 0.0
                 main_midi = None
 
+            rms_val = float(frame_rms[i]) if i < len(frame_rms) else 0.0
+
             timeline.append(
                 FramePitch(
                     time=float(time_grid[i]),
                     pitch_hz=main_pitch_hz,
                     midi=main_midi,
                     confidence=main_conf,
-                    rms=0.0,
+                    rms=rms_val,
                     active_pitches=active,
                 )
             )
@@ -490,7 +536,7 @@ def extract_features(
         stem_timelines[stem_name] = timeline
 
         # --------------------------------------------
-        # 4.6 Aggregate to Global Tracks
+        # 4.7 Aggregate to Global Tracks
         # --------------------------------------------
         if len(stem_timelines) == 1:
             # First processed stem defines initial global main/layers
