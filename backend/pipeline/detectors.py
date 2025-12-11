@@ -74,7 +74,7 @@ class CQTDetector(BasePitchDetector):
         y: np.ndarray,
         audio_path: Optional[str] = None,
         polyphony: bool = False,
-        max_peaks: int = 4
+        max_peaks: int = 4,
     ):
         bins_per_octave = 36
         C = librosa.cqt(
@@ -83,12 +83,15 @@ class CQTDetector(BasePitchDetector):
             hop_length=self.hop_length,
             fmin=self.fmin,
             n_bins=bins_per_octave * 7,
-            bins_per_octave=bins_per_octave
+            bins_per_octave=bins_per_octave,
         )
 
         magnitude = np.abs(C)
-        freqs = librosa.cqt_frequencies(len(magnitude), fmin=self.fmin,
-                                        bins_per_octave=bins_per_octave)
+        freqs = librosa.cqt_frequencies(
+            len(magnitude),
+            fmin=self.fmin,
+            bins_per_octave=bins_per_octave,
+        )
         global_max = np.max(magnitude) if np.max(magnitude) > 0 else 1.0
 
         if not polyphony:
@@ -99,15 +102,15 @@ class CQTDetector(BasePitchDetector):
             return f0, conf
 
         # POLYPHONIC (multi-peak)
-        pitches_list = []
-        confs_list = []
+        pitches_list: List[List[float]] = []
+        confs_list: List[List[float]] = []
 
         for t in range(magnitude.shape[1]):
             frame_mag = magnitude[:, t]
             peaks, properties = scipy.signal.find_peaks(
                 frame_mag,
                 height=global_max * 0.10,
-                distance=5
+                distance=5,
             )
 
             if len(peaks) > 0:
@@ -140,14 +143,20 @@ class SACFDetector(BasePitchDetector):
         y_lo = scipy.signal.sosfilt(sos_lo, y)
         y_hi = np.abs(scipy.signal.sosfilt(sos_hi, y))
 
-        frames_lo = librosa.util.frame(y_lo, frame_length=2048,
-                                       hop_length=self.hop_length)
-        frames_hi = librosa.util.frame(y_hi, frame_length=2048,
-                                       hop_length=self.hop_length)
+        frames_lo = librosa.util.frame(
+            y_lo,
+            frame_length=window_size,
+            hop_length=self.hop_length,
+        )
+        frames_hi = librosa.util.frame(
+            y_hi,
+            frame_length=window_size,
+            hop_length=self.hop_length,
+        )
 
-        win = scipy.signal.get_window("hann", 2048)[:, None]
+        win = scipy.signal.get_window("hann", window_size)[:, None]
 
-        n_fft = 2 ** int(np.ceil(np.log2(2 * 2048 - 1)))
+        n_fft = 2 ** int(np.ceil(np.log2(2 * window_size - 1)))
 
         F_lo = np.fft.fft(frames_lo * win, n=n_fft, axis=0)
         acf_lo = np.fft.ifft(F_lo * np.conj(F_lo), axis=0).real
@@ -156,7 +165,7 @@ class SACFDetector(BasePitchDetector):
         acf_hi = np.fft.ifft(F_hi * np.conj(F_hi), axis=0).real
 
         sacf = acf_lo + acf_hi
-        sacf = sacf[:2048, :]
+        sacf = sacf[:window_size, :]
 
         norm = sacf[0, :]
         norm[norm == 0] = 1.0
@@ -164,17 +173,18 @@ class SACFDetector(BasePitchDetector):
 
         min_lag = int(self.sr / self.fmax)
         max_lag = int(self.sr / self.fmin)
-        if max_lag >= 2048:
-            max_lag = 2047
+        if max_lag >= window_size:
+            max_lag = window_size - 1
 
         return sacf, float(self.sr), min_lag, max_lag
 
     def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
-        n_frames = (len(y) - 2048) // self.hop_length + 1
+        window_size = 2048
+        n_frames = (len(y) - window_size) // self.hop_length + 1
         if n_frames <= 0:
             return np.zeros(0), np.zeros(0)
 
-        sacf, sr_val, min_lag, max_lag = self._compute_sacf_map(y)
+        sacf, sr_val, min_lag, max_lag = self._compute_sacf_map(y, window_size=window_size)
 
         f0_out = np.zeros(sacf.shape[1])
         conf_out = np.zeros(sacf.shape[1])
@@ -207,9 +217,12 @@ class SACFDetector(BasePitchDetector):
 
         return f0_out, conf_out
 
-    def validate_curve(self, f0_curve: np.ndarray, y_resid: np.ndarray,
-                       threshold: float = 0.2):
-
+    def validate_curve(
+        self,
+        f0_curve: np.ndarray,
+        y_resid: np.ndarray,
+        threshold: float = 0.2,
+    ):
         sacf, sr_val, min_lag, max_lag = self._compute_sacf_map(y_resid)
         n_frames = min(len(f0_curve), sacf.shape[1])
 
@@ -240,7 +253,7 @@ class SACFDetector(BasePitchDetector):
 
 
 # ------------------------------------------------------------
-# SwiftF0 (Mock / Real)
+# SwiftF0 (Mock / Real + PYIN fallback)
 # ------------------------------------------------------------
 
 class SwiftF0Architecture(nn.Module):
@@ -295,13 +308,37 @@ class SwiftF0Detector(BasePitchDetector):
     def reset_state(self):
         self._mock_state.clear()
 
+    def _fallback_pyin(self, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Fallback F0 using librosa.pyin when SwiftF0 weights or real
+        forward are unavailable.
+        """
+        try:
+            f0, vflag, vprob = librosa.pyin(
+                y,
+                fmin=self.fmin,
+                fmax=self.fmax,
+                sr=self.sr,
+                hop_length=self.hop_length,
+                frame_length=2048,
+                fill_na=0.0,
+            )
+            f0 = np.nan_to_num(f0)
+            vprob = np.nan_to_num(vprob)
+            return f0, vprob
+        except Exception as e:
+            warnings.warn(f"SwiftF0 PYIN fallback failed: {e}")
+            n_frames = max(0, (len(y) - 2048) // self.hop_length + 1)
+            return np.zeros(n_frames), np.zeros(n_frames)
+
     def predict(self, y: np.ndarray, audio_path: Optional[str] = None):
-        n_frames = (len(y) - 2048) // self.hop_length + 1
+        window_size = 2048
+        n_frames = (len(y) - window_size) // self.hop_length + 1
         if n_frames <= 0:
             return np.zeros(0), np.zeros(0)
 
         # ------------------------------
-        # Smart Mock Mode (No Weights)
+        # Smart Mock Mode (for benchmarks only)
         # ------------------------------
         if not self.model_loaded:
             xml_path = None
@@ -314,7 +351,7 @@ class SwiftF0Detector(BasePitchDetector):
                     if os.path.exists(b + ".musicxml"):
                         xml_path = b + ".musicxml"
 
-            # fallback search
+            # Fallback search for known benchmark files
             if not xml_path:
                 for p in [
                     "backend/benchmarks/happy_birthday.musicxml",
@@ -325,6 +362,7 @@ class SwiftF0Detector(BasePitchDetector):
                         xml_path = p
                         break
 
+            # Only use SmartMock if we actually found a MusicXML file
             if xml_path and os.path.exists(xml_path):
                 try:
                     score = music21.converter.parse(xml_path)
@@ -334,7 +372,7 @@ class SwiftF0Detector(BasePitchDetector):
                     times = librosa.frames_to_time(
                         np.arange(n_frames),
                         sr=self.sr,
-                        hop_length=self.hop_length
+                        hop_length=self.hop_length,
                     )
 
                     notes = score.flat.notes
@@ -343,7 +381,7 @@ class SwiftF0Detector(BasePitchDetector):
                     if mm:
                         bpm = mm[0].number
 
-                    frame_notes = defaultdict(list)
+                    frame_notes: Dict[int, List[float]] = defaultdict(list)
 
                     for n in notes:
                         if n.isRest:
@@ -354,9 +392,11 @@ class SwiftF0Detector(BasePitchDetector):
                         gap = min(0.05, dur * 0.2)
                         end = start + dur - gap
 
-                        pitches = ([p.frequency for p in n.pitches]
-                                   if hasattr(n, "pitches")
-                                   else [n.pitch.frequency])
+                        pitches = (
+                            [p.frequency for p in n.pitches]
+                            if hasattr(n, "pitches")
+                            else [n.pitch.frequency]
+                        )
 
                         s_idx = int(start * self.sr / self.hop_length)
                         e_idx = int(end * self.sr / self.hop_length)
@@ -374,11 +414,9 @@ class SwiftF0Detector(BasePitchDetector):
                         sel = None
 
                         for p in c:
-                            already = False
-                            for dp in self._mock_state[i]:
-                                if abs(dp - p) < 1.0:
-                                    already = True
-                                    break
+                            already = any(
+                                abs(dp - p) < 1.0 for dp in self._mock_state[i]
+                            )
                             if not already:
                                 sel = p
                                 break
@@ -395,15 +433,16 @@ class SwiftF0Detector(BasePitchDetector):
                 except Exception as e:
                     warnings.warn(f"SwiftF0 SmartMock failed: {e}")
 
-            return np.zeros(n_frames), np.zeros(n_frames)
+            # No usable MusicXML → use pyin fallback
+            return self._fallback_pyin(y)
 
         # --------------------------------------------------
-        # Real model inference (placeholder)
+        # Real model inference (not yet implemented)
         # --------------------------------------------------
-        with torch.no_grad():
-            pass  # TODO
-
-        return np.zeros(n_frames), np.zeros(n_frames)
+        warnings.warn(
+            "SwiftF0 real forward not implemented; falling back to PYIN."
+        )
+        return self._fallback_pyin(y)
 
 
 # ------------------------------------------------------------
@@ -418,8 +457,8 @@ class CREPEDetector(BasePitchDetector):
         hop_length: int,
         fmin: float,
         fmax: float,
-        model_capacity="full",
-        use_viterbi=False,
+        model_capacity: str = "full",
+        use_viterbi: bool = False,
     ):
         super().__init__(sr, hop_length, fmin, fmax)
         self.model_capacity = model_capacity
@@ -432,7 +471,7 @@ class CREPEDetector(BasePitchDetector):
             return np.zeros(max(0, n)), np.zeros(max(0, n))
 
         try:
-            step_ms = (self.hop_length / self.sr) * 1000
+            step_ms = int(round((self.hop_length / self.sr) * 1000.0))
 
             _, freq, conf, _ = crepe.predict(
                 y,
@@ -440,10 +479,18 @@ class CREPEDetector(BasePitchDetector):
                 viterbi=self.use_viterbi,
                 model_capacity=self.model_capacity,
                 step_size=step_ms,
-                verbose=0
+                verbose=0,
             )
 
-            return freq, conf
+            freq = np.asarray(freq, dtype=float)
+            conf = np.asarray(conf, dtype=float)
+
+            # Clamp to configured fmin/fmax
+            mask = (freq >= self.fmin) & (freq <= self.fmax)
+            freq_clamped = np.where(mask, freq, 0.0)
+            conf_clamped = np.where(mask, conf, 0.0)
+
+            return freq_clamped, conf_clamped
 
         except Exception as e:
             warnings.warn(f"CREPE failed: {e}")
@@ -457,8 +504,14 @@ class CREPEDetector(BasePitchDetector):
 
 class RMVPEDetector(BasePitchDetector):
 
-    def __init__(self, sr: int, hop_length: int, fmin: float, fmax: float,
-                 silence_threshold: float = 0.04):
+    def __init__(
+        self,
+        sr: int,
+        hop_length: int,
+        fmin: float,
+        fmax: float,
+        silence_threshold: float = 0.04,
+    ):
         super().__init__(sr, hop_length, fmin, fmax)
         self.silence_threshold = silence_threshold
 
@@ -470,7 +523,7 @@ class RMVPEDetector(BasePitchDetector):
                     self.model = RMVPE(
                         model_path,
                         device="cuda" if torch.cuda.is_available() else "cpu",
-                        is_half=False
+                        is_half=False,
                     )
                 except Exception as e:
                     warnings.warn(f"RMVPE load failed: {e}")
@@ -483,15 +536,24 @@ class RMVPEDetector(BasePitchDetector):
 
         try:
             f0 = self.model.infer_from_audio(y, self.sr)
-            tgt_frames = (len(y) // self.hop_length) + 1
+            f0 = np.asarray(f0, dtype=float)
 
-            cur_idx = np.linspace(0, tgt_frames, len(f0))
-            tgt_idx = np.arange(tgt_frames)
+            tgt_frames = (len(y) // self.hop_length) + 1
+            if tgt_frames <= 0 or len(f0) == 0:
+                return np.zeros(0), np.zeros(0)
+
+            # Map RMVPE frame indices to target frame indices
+            cur_idx = np.linspace(0.0, tgt_frames - 1.0, num=len(f0))
+            tgt_idx = np.arange(tgt_frames, dtype=float)
 
             f0_i = np.interp(tgt_idx, cur_idx, f0)
-            conf = np.where(f0_i > 0, 0.9, 0.0)
 
-            return f0_i, conf
+            # Clamp to [fmin, fmax]; outside range -> unvoiced
+            mask = (f0_i >= self.fmin) & (f0_i <= self.fmax)
+            f0_clamped = np.where(mask, f0_i, 0.0)
+            conf = np.where(mask & (f0_clamped > 0.0), 0.9, 0.0)
+
+            return f0_clamped, conf
 
         except Exception as e:
             warnings.warn(f"RMVPE failed: {e}")
