@@ -1,7 +1,19 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 import numpy as np
 import music21
-from music21 import stream, note, chord, tempo, meter, key, dynamics, articulations, layout, clef
+from music21 import (
+    stream,
+    note,
+    chord,
+    tempo,
+    meter,
+    key,
+    dynamics,
+    articulations,
+    layout,
+    clef,
+)
+
 from .models import NoteEvent, AnalysisData
 from .config import PIANO_61KEY_CONFIG, PipelineConfig
 
@@ -19,8 +31,10 @@ def quantize_and_render(
     - Uses beat-based durations and onsets from Stage C (duration_beats, start_beats).
     - Chord representation via music21.chord.Chord when multiple notes share onset.
     - Ties handled via music21.makeMeasures() + makeTies().
+    - Rests filled via makeRests() for complete measures.
     - Dynamics from NoteEvent.velocity (0–1) and NoteEvent.dynamic ('p', 'mf', 'f').
     - Staccato marking for short notes based on threshold_beats.
+    - Glissando config is read but not yet applied (explicit TODO).
     """
 
     d_conf = config.stage_d
@@ -28,8 +42,14 @@ def quantize_and_render(
     ts_str = analysis_data.meta.time_signature if analysis_data.meta.time_signature else "4/4"
     split_pitch = d_conf.staff_split_point.get("pitch", 60)  # C4
 
-    # Optional divisions_per_quarter (music21 will choose internal divisions, but we can respect grid via beats)
+    # NOTE: divisions_per_quarter is currently not used.
+    # music21 chooses internal divisions automatically; we
+    # keep this knob in config for potential future grid forcing.
     divisions_per_quarter = getattr(d_conf, "divisions_per_quarter", None)
+
+    # Glissando config (currently not applied in v1)
+    gliss_conf = d_conf.glissando_threshold_general
+    piano_gliss_conf = d_conf.glissando_handling_piano
 
     # --------------------------------------------------------
     # 1. Setup Score and Parts (treble + bass)
@@ -73,7 +93,7 @@ def quantize_and_render(
     # Prefer Stage C's quantized fields; fallback to seconds.
     quarter_dur = 60.0 / float(bpm)
 
-    def get_event_beats(e: NoteEvent):
+    def get_event_beats(e: NoteEvent) -> Tuple[float, float]:
         # duration_beats (from Stage C) if present
         dur_beats = getattr(e, "duration_beats", None)
         if dur_beats is None:
@@ -90,8 +110,14 @@ def quantize_and_render(
     events_sorted = sorted(events, key=lambda e: (e.start_sec, e.midi_note))
 
     # Group key: (staff_name, start_beat_quantized) -> list[NoteEvent]
-    # We assume Stage C already quantized to a grid; we use a small rounding to avoid FP noise.
-    staff_groups = {}
+    # We assume Stage C already quantized to a grid; we use a small rounding
+    # to avoid FP noise.
+    #
+    # NOTE:
+    # All notes on the same staff and onset beat are rendered as a single chord.
+    # Multi-voice notation on the same staff is not yet supported (future option:
+    # use NoteEvent.voice to split into separate Voices instead of one Chord).
+    staff_groups: Dict[Tuple[str, float], List[NoteEvent]] = {}
 
     for e in events_sorted:
         # Staff from NoteEvent if set; otherwise use split_pitch rule
@@ -121,8 +147,9 @@ def quantize_and_render(
         """
         # Use quantized beats from Stage C if present, else fallback to seconds
         start_beats, dur_beats_first = get_event_beats(group[0])
+
         # If durations differ in group, we take the max (block chord assumption)
-        dur_beats_candidates = []
+        dur_beats_candidates: List[float] = []
         for e in group:
             _, dur_b = get_event_beats(e)
             dur_beats_candidates.append(dur_b)
@@ -136,7 +163,7 @@ def quantize_and_render(
         midi_pitches = sorted(list({e.midi_note for e in group}))
 
         if len(midi_pitches) > 1:
-            m21_obj = chord.Chord(midi_pitches)
+            m21_obj: music21.note.NotRest = chord.Chord(midi_pitches)
         else:
             m21_obj = note.Note(midi_pitches[0])
 
@@ -191,18 +218,28 @@ def quantize_and_render(
     s.append(part_bass)
 
     # --------------------------------------------------------
-    # 4. Make Measures, Ties, and layout
+    # 4. Make Measures, Rests, Ties, and layout
     # --------------------------------------------------------
 
     try:
         # makeMeasures splits notes across bars and sets <measure> structure.
         s_quant = s.makeMeasures(inPlace=False)
 
+        # Fill gaps with rests so measures are complete
+        s_quant.makeRests(inPlace=True)
+
         # Create ties for split notes
         s_quant.makeTies(inPlace=True)
 
+        # TODO (future): Implement glissando spanners based on gliss_conf and piano_gliss_conf:
+        # - For non-piano profiles, detect adjacent notes on same staff/voice where:
+        #       |Δpitch_semitones| >= gliss_conf["min_semitones"]
+        #       and Δtime_beats <= gliss_conf["max_time_ms"] / (60000.0 / bpm)
+        #   and insert music21.spanner.Glissando(start_note, end_note).
+        # - For piano when piano_gliss_conf["enabled"] is False, skip glissando encoding.
+
     except Exception as e:
-        print(f"[Stage D] makeMeasures/makeTies failed: {e}")
+        print(f"[Stage D] makeMeasures/makeRests/makeTies failed: {e}")
         s_quant = s  # fallback: raw score (export might still work if durations are sane)
 
     # --------------------------------------------------------
