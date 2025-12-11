@@ -229,9 +229,10 @@ def load_and_preprocess(
     hop = 1024
     if len(y_norm) >= frame_len:
         rms = librosa.feature.rms(y=y_norm, frame_length=frame_len, hop_length=hop)[0]
-        noise_floor_rms = np.percentile(rms, percentile)
+        noise_floor_rms = float(np.percentile(rms, percentile))
         noise_floor_db = 20.0 * np.log10(noise_floor_rms + 1e-9)
     else:
+        noise_floor_rms = 0.0
         noise_floor_db = -80.0
 
     # -----------------------------
@@ -275,7 +276,7 @@ def load_and_preprocess(
     # Default tempo if detection failed
     tempo_bpm = float(bpm) if bpm is not None else 120.0
 
-       meta = MetaData(
+    meta = MetaData(
         tuning_offset=0.0,
         detected_key="C",  # can be updated later by key detection
         lufs=float(config.loudness_normalization.get("target_lufs", -23.0)),
@@ -293,16 +294,16 @@ def load_and_preprocess(
         target_sr=target_sr,
         duration_sec=float(len(y_norm) / sr),
 
+        # beat grid lives both in MetaData and StageAOutput
+        beats=[float(b) for b in beats],
+
         audio_path=audio_path,
         n_channels=n_channels,
-        normalization_gain_db=norm_gain_db,
+        normalization_gain_db=norm_gain,
         rms_db=rms_db,
-        # ✅ store Stage A diagnostics into MetaData
-        noise_floor_rms=float(noise_floor_rms),
-        noise_floor_db=float(noise_floor_db),
+        noise_floor_rms=noise_floor_rms,
+        noise_floor_db=noise_floor_db,
         pipeline_version="2.0.0",
-        # ✅ also store the beat grid directly in MetaData
-        beats=list(beats),
     )
 
     # -----------------------------
@@ -312,8 +313,8 @@ def load_and_preprocess(
         stems=stems_output,
         meta=meta,
         audio_type=audio_type,
-        # ✅ expose diagnostics at Stage A level too
-        noise_floor_rms=float(noise_floor_rms),
-        noise_floor_db=float(noise_floor_db),
-        beats=list(beats),
+        noise_floor_rms=noise_floor_rms,
+        noise_floor_db=noise_floor_db,
+        beats=[float(b) for b in beats],
     )
+
