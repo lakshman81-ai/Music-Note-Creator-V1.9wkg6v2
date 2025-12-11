@@ -14,7 +14,7 @@ def quantize_and_render(
     Stage D: Render Sheet Music (MusicXML) using music21.
     """
     d_conf = config.stage_d
-    bpm = analysis_data.meta.tempo_bpm if analysis_data.meta.tempo_bpm else 120.0
+    bpm = float(analysis_data.meta.tempo_bpm) if analysis_data.meta.tempo_bpm else 120.0
     ts_str = analysis_data.meta.time_signature if analysis_data.meta.time_signature else "4/4"
     split_pitch = d_conf.staff_split_point.get("pitch", 60) # C4
 
@@ -98,12 +98,12 @@ def quantize_and_render(
         # For simplicity (WI "Chords"), we assume block chords if onsets match.
         # We take the max duration of the group.
 
-        start = group[0].start_sec
+        start = float(group[0].start_sec)
         # Determine duration
-        max_end = max(e.end_sec for e in group)
+        max_end = float(max(e.end_sec for e in group))
         dur_sec = max_end - start
         quarter_dur = 60.0 / bpm
-        q_len = dur_sec / quarter_dur
+        q_len = float(dur_sec / quarter_dur)
 
         # Quantize q_len to nearest 1/16th (0.25)
         # divisions_per_quarter usually handles display, but q_len is float.
