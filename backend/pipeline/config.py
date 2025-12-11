@@ -11,18 +11,26 @@ class StageAConfig:
     target_sample_rate: int = 44100
     channel_handling: str = "mono_sum"  # "mono_sum", "left_only", "right_only"
     dc_offset_removal: bool = True
+
+    # Transient emphasis (hammer clicks)
     transient_pre_emphasis: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True, "alpha": 0.97}
     )
+
+    # High-pass filter (protect C2 ≈ 65.4 Hz)
     high_pass_filter_cutoff: Dict[str, Any] = field(
         default_factory=lambda: {"value": 55.0}
     )
     high_pass_filter_order: Dict[str, Any] = field(
         default_factory=lambda: {"value": 4}
     )
+
+    # Silence trimming (keep decay tails)
     silence_trimming: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True, "top_db": 50}
     )
+
+    # Loudness normalization (EBU R128)
     loudness_normalization: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True, "target_lufs": -23.0}
     )
@@ -40,10 +48,11 @@ class StageAConfig:
     noise_floor_estimation: Dict[str, Any] = field(
         default_factory=lambda: {"percentile": 30}
     )
+
+    # BPM / beat grid detection
     bpm_detection: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": True}
     )
-
 
 
 # ------------------------------------------------------------
@@ -66,10 +75,8 @@ class StageBConfig:
     # Cross-detector disagreement tolerance (cents)
     pitch_disagreement_cents: float = 70.0
 
-    # Ensemble weights (used in Stage B weighted average)
-    # WI-aligned core:
-    #   SwiftF0: 0.5, SACF: 0.3, CQT: 0.2
-    # Others kept reasonable for non-piano profiles.
+    # Ensemble weights (WI-aligned core)
+    #   Piano: SwiftF0 dominates, SACF/CQT support.
     ensemble_weights: Dict[str, float] = field(
         default_factory=lambda: {
             "swiftf0": 0.5,
@@ -90,8 +97,6 @@ class StageBConfig:
     )
 
     # Global detector enable flags + defaults
-    # NOTE: Instrument-specific ranges / options are driven by InstrumentProfile,
-    # Stage B uses this mainly for "enabled" flags.
     detectors: Dict[str, Any] = field(
         default_factory=lambda: {
             "rmvpe": {
@@ -252,7 +257,6 @@ _profiles: List[InstrumentProfile] = [
         special={
             "viterbi": True,
             "silence_threshold": 0.04,
-            # Smoothing may be useful for legato; keep default (3) if not overridden.
         },
     ),
 
@@ -274,7 +278,6 @@ _profiles: List[InstrumentProfile] = [
         fmin=30.0,
         fmax=400.0,
         special={
-            # For later: can be used to set YIN frame_length if Stage B is extended.
             "frame_length": 8192,
         },
     ),
@@ -298,7 +301,6 @@ _profiles: List[InstrumentProfile] = [
         fmin=261.0,
         fmax=3349.0,
         special={
-            # Hint for potential future window tuning
             "small_window": True,
         },
     ),
