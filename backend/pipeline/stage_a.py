@@ -221,6 +221,22 @@ def load_and_preprocess(
             warnings.warn(f"Loudness normalization failed: {e}")
             y_norm = y_trimmed
 
+    # 7b. Peak Limiter (optional, from config.peak_limiter)
+    pl_conf = getattr(config, "peak_limiter", {"enabled": False})
+    if pl_conf.get("enabled", False):
+        mode = pl_conf.get("mode", "soft")        # "soft" or "hard"
+        ceiling_db = pl_conf.get("ceiling_db", -1.0)
+        # Convert dB ceiling to linear amplitude
+        ceiling_lin = 10.0 ** (ceiling_db / 20.0)
+
+        if mode == "soft":
+            # Soft clipping using tanh
+            # scale into [-1,1] around the ceiling, then tanh, then scale back
+            y_norm = np.tanh(y_norm / ceiling_lin) * ceiling_lin
+        else:
+            # Hard clip
+            y_norm = np.clip(y_norm, -ceiling_lin, ceiling_lin)
+
     # -----------------------------
     # 8. Peak Limiter (Soft clip / -1 dB ceiling)
     # -----------------------------
